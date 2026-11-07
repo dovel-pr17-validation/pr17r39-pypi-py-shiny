@@ -1,0 +1,1306 @@
+# Change Log for Shiny (for Python)
+
+All notable changes to Shiny for Python will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Lifecycle changes
+
+* The first argument of `reactive.invalidate_later()` is renamed from `delay` to `delay_secs`, to make clear that it is in seconds, not milliseconds. Passing `delay=` still works but emits a `ShinyDeprecationWarning`. Calls that pass the delay by position are unaffected (#2604).
+
+### New features
+
+* Added `reactive.debounce()` and `reactive.throttle()`, decorators that slow down how often a reactive function invalidates its readers. They go below `@reactive.calc`; effects and outputs read the debounced calc instead (an effect reacts to it with `@reactive.event()`). To limit an existing calc or input, call them directly, as in `reactive.debounce(input.text, 0.5)`, which returns a calc. `debounce` waits until the changes stop for a set time; `throttle` lets a change through at most once per time window. Use them when a value changes often (typing, slider drags, plot hover) and the work that reads it is slow. Under OpenTelemetry, the calc above them records its span as `reactive.calc debounce <name>` or `reactive.calc throttle <name>`; the reactives behind them record none. (#564)
+
+### Bug fixes and minor improvements
+
+* Lowered the minimum `orjson` version from 3.10.7 to 3.10.2. Shiny uses only `orjson.dumps()`, `orjson.loads()`, and `OPT_SORT_KEYS`, which all predate 3.10, and 3.10.2 fixes a crash serializing `str` that 3.10.1 introduced. The lower floor lets Shiny install alongside packages or environments that ship an older `orjson`, such as Pyodide 0.27 (#2594).
+
+* `playwright.controller.NavPanel.click()` now expands a navbar that has collapsed behind its toggler button before clicking the tab, as it already opened a closed dropdown. `ui.page_navbar()` and `ui.navset_bar()` collapse their tabs below 768px wide, so clicking a tab in a narrow window or iframe used to fail (#2597).
+
+* `playwright.controller.OutputPlot` now finds a plot output by its `shiny-plot-output` class alone (#2596).
+
+* When a client message's `method` is not a string, the session now prints `Message 'method' must be a string.` and closes, instead of printing an unrelated `TypeError` traceback. A client message that is not a JSON object (such as `1`) now prints `Message does not contain 'method'.` and closes the session the same way (#2607).
+
+## [1.9.0] - 2026-10-29
+
+### Breaking changes
+
+* OpenTelemetry `reactive_update` spans now follow each session's cycle: one span per session, from when the session turns busy until all of its effects (including async ones) have finished, carrying the session's `session.id`. The session's calc, effect, and output spans are its children. Previously, there was one span per reactive flush, which can serve several sessions, so with concurrent effects it couldn't carry a single `session.id` and ended before async effects finished. Effects without a session no longer have a `reactive_update` parent (#2522).
+
+* Reactive effects now run concurrently. Shiny starts each invalidated effect without waiting for an `async` effect's awaited part, so a slow `async` effect, calc, or render function no longer delays other sessions. Within a session, input changes and `reactive.invalidate_later()` still wait until all of that session's effects have finished, and outputs are sent together once they have. What app authors may notice:
+
+    * `async` effects interleave at each `await` instead of running one after another. `priority` orders when effects start, not when they finish. Runs of the same effect still don't overlap: a re-run waits for the previous run.
+
+    * `reactive.lock()` is now defunct and no longer locks the reactive graph. Please remove it from your code.
+
+    * `await reactive.flush()` returns right away, without waiting for dependents, when called from within an effect, a `reactive.on_flushed()` or `session.on_flush()`/`session.on_flushed()` callback, or a task one of these started while it is still running, since waiting there could deadlock. A task that outlives the effect that started it, such as an extended task's body, still waits. The wait covers the whole process, including other sessions' effects and output.
+
+    * `reactive.on_flushed()` callbacks run after each round of effects has *started*, without waiting for `async` effects, and can run several times per `reactive.flush()`. Previously, they ran once all effects had finished. An error in one of these callbacks is now printed, and the other callbacks still run, instead of closing a session.
+
+    * Message handlers (`session.set_message_handler()`) run in their own task, so a slow handler no longer holds up other messages from the client.
+
+    * Each session sends its outputs in a task of its own, once all of its effects have finished. A slow client, or a slow `session.on_flush()` callback, delays only its own session's output, not other sessions' output or other reactive work.
+
+    * Setting a `reactive.value` now re-runs its dependents automatically, without a call to `reactive.flush()`. The reactive graph itself still isn't thread-safe, so from another thread use `loop.call_soon_threadsafe(value.set, new_value)`.
+
+    * File uploads and `session.dynamic_route()` requests no longer mark the session busy.
+
+    * Destroying an effect (`effect.destroy()`) cancels its in-progress run, raising `asyncio.CancelledError` at its current `await`. So ending a session, or `session.destroy(id)`, cancels its in-progress `async` effects and render functions instead of letting them run on after the session or module is gone.
+
+  (#2508, #2515)
+
+* `near_points(add_dist=True)`, imported from `shiny.plotutils`, now names its distance column `dist_` instead of `dist`. Code reading `df["dist"]` from the result must now read `df["dist_"]` (#2510).
+
+### Lifecycle changes
+
+* `reactive.lock()` is now defunct: it no longer locks the reactive graph and emits a `ShinyDeprecationWarning`. Please remove it from your code (#2520).
+
+* `shiny add test` is deprecated and now prints a deprecation warning. It will be removed in a future release. Please use the `shiny-for-python` Agent Skill with a coding agent to generate tests instead (#2566).
+
+### New features
+
+* New `session.run_once_when_idle()` runs a function once, after the session's effects have finished and its outputs have been sent. Use it to change reactive state from a background task or a custom timer without changing a value that a running effect is still reading (#2546).
+
+* `ui.sidebar()` gains a `role` argument (`"form"`, `"search"`, `"complementary"`, or `"region"`) for opt-in ARIA landmark markup (rstudio/bslib#1359). `"complementary"` renders an `<aside>`, other roles render a `<div>` with the corresponding `role` attribute, and landmark roles require an accessible name (from `title`, `aria_label`, or `aria_labelledby`). Note that the default (`role=None`) now renders a neutral `<div>` instead of an `<aside>`. In addition, `ui.page_sidebar()` now places the whole sidebar layout inside the page's `<main>` landmark (#2526).
+
+### Bug fixes and minor improvements
+
+* On Windows, an output's busy indicator now shows while the output renders. Previously, when a synchronous render function blocked the event loop, the message that turns on the indicator reached the browser together with the output's new value, so most outputs never showed it (#1381).
+
+* UI updates and custom messages sent from outside the reactive graph (e.g. from a background `asyncio` task that calls `ui.update_text()`) are now sent to the client right away instead of waiting for the next input change (#21, #1889).
+
+* `Jsonifiable` now uses `Sequence` and `Mapping` for its container arms instead of the invariant `List` and `Dict`, so values like `dict[str, int]` and `list[str]` type-check as `Jsonifiable`, including as the return type of a function passed to a `Renderer[Jsonifiable]`. As a side effect, type checkers also accept other sequences and mappings, such as `range`, `deque`, and `bytes`, even though only `list`, `tuple`, and `dict` serialize. Runtime behavior is unchanged (@wolfgang-aura, #2511).
+
+* `near_points(add_dist=True)`, imported from `shiny.plotutils`, now adds the `dist_` column its documentation describes, instead of a column named `dist`. The trailing underscore keeps it from colliding with a `dist` column in your own data. Code reading `df["dist"]` from the result must now read `df["dist_"]` (#2510). `near_points()` and `brushed_points()` also now map a non-string categorical column (e.g. one of integers) to its category codes, instead of raising `ValueError: to_float: unsupported dtype for x` (#2505).
+
+* `@output_args()` in Express now accepts every argument of the output's UI function, with matching types. `@render.ui` now takes `inline`, `container`, `fill`, `fillable`, and HTML attributes, instead of raising a `TypeError`. `@render.text` now takes `container`. `@render.plot` and `@render.image` now declare `inline`, `click`, `dblclick`, `hover`, `brush`, and `fill` explicitly (and `width` and `height` for `@render.image`), instead of accepting any keyword. `@render.download_button` and `@render.download_link` now take `label` (#2539).
+
+* `Progress.set(0)` now places the bar at `0` relative to `min` and `max`, instead of sending `0` unnormalized. Previously, with a negative `min`, such as `Progress(min=-10, max=10)`, a value of `0` showed an empty bar rather than a half-full one (#2518).
+
+* `@render.data_frame` now serializes Polars `Categorical` and `Enum` columns with Polars >= 2.0, instead of raising `AttributeRemovedError: get_categories was removed in version 2.0` (#2529).
+
+* `@render.data_frame` now labels key-value `Map` columns (e.g. a pyarrow `map<string, int64>` column) as `object`, like struct, list, and array columns. This requires a narwhals version that has the `Map` dtype (#2569).
+
+* `@render.data_frame` now sends values of pandas nullable dtypes (`Int64`, `Float64`, `boolean`) to the browser as numbers and booleans, instead of strings such as `"1"` and `"True"`. It also serializes data frames faster and with less memory: a 100,000-row frame with mixed column types serializes 2-3.5x faster, with a 15-40% lower memory peak. The largest gains are for pandas datetime and timedelta columns, duration columns, and `Decimal` or missing (`pd.NA`) values. Editing a cell no longer copies the whole data frame (@FBruzzesi, #2572).
+
+* `@render.data_frame`'s `selection_mode` now accepts a list (e.g. `["rows"]`), as its type hint says, instead of raising `TypeError: unhashable type: 'list'`, and a `set_patches_fn()` that returns badly shaped patches now raises the intended `ValueError` describing the expected shape (#2560).
+
+* `@render.download_button` and `@render.download_link` gain an `icon` argument, and pass any other keyword arguments (e.g. `class_="btn-success"`) to the control they auto-place in Express, so an Express app no longer needs `ui.hold()` and a hand-placed `ui.download_button()` just to add an icon. The same arguments can also be given with `@output_args()` (@raashish1601, #2533). Setting a reactive value from a `@render.download_button` download handler now updates the outputs and effects that read it right away, including while a streamed download is still sending, instead of only after the next message from the client (#1785).
+
+* `req(False, cancel_output=True)` inside a `@reactive.effect` now stops the effect silently, instead of being treated as an unhandled error that closes the session. `SilentCancelOutputException` now subclasses `SilentException` (#2560).
+
+* `session.bookmark.on_bookmark()` callbacks in a module now have their saved files found on restore. Restore now looks in `<dir>/<ns>`, where the files are saved, instead of `<dir>/<ns>-` (#2560).
+
+* `session.on_flush()` and `session.on_flushed()` callbacks registered while the session's flush callbacks run (by one of them, or by a task that ran while an `async` one was waiting) now run with one more output flush right after, instead of waiting for the next input change. The same goes for a message one of them queues, such as a `ui.update_*()` in an `on_flushed` callback. That output flush starts 10 ms later, so a callback that causes one every time it runs (e.g. a `once=False` callback that calls `ui.update_*()`) repeats at most 100 times a second (#2580).
+
+* `shiny create` now offers the "Stream markdown with enterprise LLM" templates, which were previously never found because of a misspelled path (#2560).
+
+* In `ui.input_date()`, `datesdisabled` now works when `format` is not the default `yyyy-mm-dd`. The dates are now converted on the client the same way `min`/`max` are, instead of being parsed by bootstrap-datepicker with the display `format`. The `data-date-dates-disabled` attribute is replaced by `data-dates-disabled` (and omitted when `datesdisabled` is `None`), and `controller.InputDate.expect_datesdisabled()` checks the new attribute. This relies on the updated vendored `shiny.js` (rstudio/shiny#4434, #2523).
+
+* `ui.navset_tab()` and the other navsets now add `aria-controls`, pointing at the panel's `id`, to nav links that target a tab panel, alongside the existing `href` (rstudio/bslib#1355, #2526).
+
+## [1.8.0] - 2026-09-12
+
+### Deprecations
+
+* `ui.output_text_verbatim()` is deprecated and now emits a `ShinyDeprecationWarning`. Please use `ui.output_code()` / `@render.code` to create an output container for code (monospaced text), or `ui.output_text()` / `@render.text` to create an output container for plain text. (#2097)
+
+* `playwright.controller.OutputTextVerbatim` is deprecated alongside `ui.output_text_verbatim()` and now emits a `ShinyDeprecationWarning` when constructed. Please use `playwright.controller.OutputCode` instead. (#2097)
+
+### New features
+
+* Added `local_server`, a pytest fixture that is the in-memory counterpart of `local_app`: a function-scoped `test_server()` session for the `app.py` next to the test file. (#2495)
+
+* Added `session.allow_reconnect()`. Call it with `True` to let the browser reconnect to its session (showing a countdown dialog instead of the "Disconnected from server" overlay) when the hosting environment keeps sessions alive after a client disconnects, or with `"force"` to attempt the reconnect anywhere. (#2441)
+
+* Added `shiny.testserver.test_server()`, an in-memory server testing API for testing reactive server functions and Shiny apps headlessly, without a browser. (#2470)
+
+* Added `ui.page_html()`, for apps whose UI is a complete HTML document they own (e.g. the `index.html` a JS bundler emits) rather than one built from `ui.page_*()` components. It takes the document as a string or a `Path`, plus optional `extra_deps=`. Pass the result as `App(ui=)`, or return it from a UI function (`App(ui=lambda request: ...)`, which is what bookmarking requires): the document is served as-is, with Shiny's own HTML dependencies -- plus any in `extra_deps=` -- inserted at `<meta name="shiny-dependency-placeholder" content="">` (or a custom `deps_replace_pattern=`), and their files served by the app. In Express, use `ui.page_opts(html=)`, which routes the whole app through `ui.page_html()`: top-level UI markup is dropped (the document already is the page) but its HTML dependencies are kept. This is the Python counterpart to Shiny for R's `shinyApp(ui = htmlTemplate("index.html", document_ = TRUE))` with `attachDependencies()`. (#2462)
+
+### Improvements
+
+* Stub files for `folium`, `uvicorn`, and `seaborn` are now generated with Pyrefly instead of Pyright. (Thanks, @ChidiebereNjoku!) (#2478)
+
+* `playwright.controller.Offcanvas` now supports `open()`, `loc_trigger`, `loc_title`, `loc_footer`, and the expectation methods `expect_title()`, `expect_footer()`, and `expect_placement()`. (#2451)
+
+* `shiny skills` CLI help and the README now explain that [`library-skills`](https://library-skills.io) must be run from your own project directory, since it installs the bundled Agent Skills of the packages that project has installed. The previous wording left that precondition implicit, so running the command from an empty directory or from a clone of py-shiny silently installed nothing. (#2447)
+
+* `shiny.testserver.test_server()` is now documented in the bundled `shiny-for-python` Agent Skill, in a new `test-server` topic, so coding agents reach for in-memory server tests instead of hand-built sessions or a browser when only server logic needs checking. (#2491)
+
+* `ui.navset_tab()` and the other navsets created with an `id` now use that `id` as their `data-tabsetid`, so their tab panes get stable `tab-tabs-0` style DOM ids instead of ones built from a random integer. This makes the rendered markup reproducible across renders and easier to target from custom CSS and JavaScript. Navsets without an `id`, and `ui.nav_menu()` dropdowns, keep the random ID. (Thanks, @pevolution-ahmed!) (#2410)
+
+### Bug fixes
+
+* Closing a session no longer destroys the reactive values and calcs created in it, so async work that outlives the connection does not error. Since v1.6.1, refreshing the page while an `@reactive.extended_task` (or any `asyncio` task) was in flight could raise `DestroyedReactiveError: Reactive value '<name>' has been destroyed.` once it settled, leaving the task in neither `"success"` nor `"error"`. Values and calcs are now left readable at their last value on close and reclaimed by garbage collection, while an explicit `session.destroy(id)` on a live session still tears them down. Effects are still destroyed on close. (#2428)
+
+* `@expressify` and `@render.express` no longer fail with `RuntimeError: Failed to find function '...' in AST` when another decorator has changed the function's `__name__`. The AST lookup matched on `__name__`, which a decorator can rewrite; it now matches on the function's code object name, which always reflects the name at the `def` site. This pattern is commonly used to give each `@render.express` function in a loop a unique output id. When `@expressify` cannot locate a function's definition, the error now names the function as it appears in the source (rather than a `__name__` a decorator may have rewritten), points at the file and line it looked at, and lists the likely causes — an `async def`, a decorator below `expressify()` that returns a wrapper instead of the original function, or a source file modified after import. (#2016)
+
+* `playwright.controller.InputSelectize` no longer clicks the page body to close the selectize dropdown. `expect_choices()`, `expect_choice_labels()`, and `expect_choice_groups()` open the dropdown, because selectize renders its choices into the DOM only after the first open. The click that closed the dropdown again landed on app content and fired the app's own click handlers, so a test could record an interaction that it never made. The controller now calls `close()` on the selectize instance instead, which touches no app content. (#2426)
+
+* `@render.data_frame` now renders data frames whose column names are empty (`""`) or are not strings: column ids are positional and are never derived from the column name, and a column named `0` no longer renders a blank header. Its `.update_sort()` also now honors its documented default for bare column indices, so `desc` follows the column dtype: number-like columns sort descending and everything else sorts ascending. (#2421)
+
+* `@render.download_button`, `@render.download_link`, and the deprecated `@render.download` now honor `@output(id=)`. The download handler was registered under the decorated function's name, but the URL rendered by the control used the `@output(id=)` value, so clicking the control returned a 404. (#2415)
+
+* `@render.ui` and other dynamically-rendered outputs inside a `ui.popover()` or `ui.tooltip()` without a `title=` no longer get stuck showing "recalculating". The container collapsed to 0 width, so the output's `ResizeObserver` never fired; vendored bslib CSS now gives it a non-zero minimum width. (#2446)
+
+* `shiny run --app-dir <dir> <app>` now honors `--app-dir` for Shiny Express apps. Express detection looked for the app file relative to `--app-dir`, but the entrypoint that gets handed to uvicorn was then built by resolving the app path against the current working directory instead, so running an Express app from outside its directory failed with a `FileNotFoundError` for a path that never existed. (#2419)
+
+* `ui.input_bookmark_button()` is now included in the Express API reference. (#2418)
+
+* `ui.input_selectize()`'s `options` docstring now correctly points at `ui.js_eval()` for marking a string as a JavaScript function. (#2416)
+
+* `ui.input_slider()` and `ui.update_slider()` now encode `datetime.date` values as UTC midnight, so they no longer shift by a day when the server runs in a timezone ahead of UTC. Dates were encoded as local midnight, but the client formats and reads slider dates back in UTC, so on e.g. `Europe/Amsterdam` an update to `2025-01-01` landed on `2024-12-31`. Naive (timezone-less) `datetime.datetime` values are likewise anchored to UTC and round-trip unchanged, instead of shifting by the server's UTC offset: such a value was encoded as if it named a local time, but the client sends it back to be decoded as UTC, so a slider set to `12:00` reported `11:00` on a server in `Europe/Amsterdam`. Timezone-aware datetimes name an absolute instant and are unaffected. (#2398)
+
+* `ui.input_task_button(type=None)` no longer drops the `bslib-task-button` class. Operator precedence made the `type is not None` check apply to the whole class string rather than just the Bootstrap classes, so the button rendered with `class=""`; since that class is the selector Shiny's input binding uses, the button was never bound as an input and clicking it did nothing. (#2388)
+
+* `ui.show_offcanvas()` now accepts the `id` (a string) of a `ui.offcanvas()` panel already in the UI and reveals it, matching its sibling functions `ui.hide_offcanvas()` / `ui.toggle_offcanvas()`. Previously, passing a string raised an unhandled `AttributeError` from deep inside the implementation. `ui.show_offcanvas()` also now accepts bare tag content (wrapping it into a new anonymous panel), in addition to a `ui.offcanvas()` object; a string that looks like body text instead of an id (empty, or containing whitespace) raises an actionable `ValueError`. (#2445)
+
+* `ui.Theme`'s API reference examples now run in Shinylive. Compiling a customized theme requires `libsass`, but Shinylive only auto-loads packages it finds in an app's top-level imports and `Theme.to_css()` imports `sass` lazily, so the examples died with an `ImportError`; the example directory now declares `libsass` in a `requirements.txt`. The error raised when a package required for theme compilation is missing is also fixed: it interpolated the package name into the first sentence but printed a literal `pip install {pkg}` in the second. (#2387)
+
+## [1.7.0] - 2026-07-28
+
+### New features
+
+* Added test mode, enabled via the `SHINY_TESTMODE=1` environment variable or the `App(test_mode=)` argument (which defaults to that env var). The pytest app-launch fixtures (`local_app`, `create_app_fixture`) now run apps in test mode. (#2269)
+
+* When test mode is enabled, each session serves a JSON snapshot of its `input`, `output`, and `export` values at `/session/{id}/dataobj/shinytest` (URL available via `session.get_test_snapshot_url()`). App authors can surface internal reactive values with `shiny.testmode.export_test_values()`. The endpoint honors query params `input`/`output`/`export` to select specific blocks (`=1` for a whole block, or a comma-separated list of keys); unlike R, requesting no blocks returns all three rather than a `400`. (#2269)
+
+* `input.set_snapshot_preprocess(id, fn)` (or `shiny.testmode.snapshot_preprocess_input()`) and `my_output.snapshot_preprocess(fn)` preprocess test-mode snapshot values before they are written, e.g. to scrub timestamps or temp paths. Handlers may be synchronous or asynchronous. File inputs automatically scrub each file's `datapath` to its basename. `export_test_values()` moved from `shiny.session` to the new `shiny.testmode` module. (#2282)
+
+* `shiny.playwright.controller.AppTestValues` reads a session's test-mode snapshot (`input`/`output`/`export`) in end-to-end tests. Its expect methods accept predicates: pass any callable (e.g. `app_values.expect_input("n", is_integer)`) in place of an expected value, and the expectation retries until the predicate returns a truthy value. (#2269, #2357)
+
+* `offcanvas()` creates sliding Bootstrap Offcanvas panels that appear from a viewport edge. Panels can be triggered by a UI element, revealed programmatically with `show_offcanvas()`, or controlled by id with `hide_offcanvas()` and `toggle_offcanvas()`. (#2279)
+
+* `@render.download_button` and `@render.download_link` pair 1:1 with `ui.download_button()` and `ui.download_link()`. (#2364)
+
+* The shiny package now ships bundled [Agent Skills](https://agentskills.io) under `shiny/.agents/skills/` (the [library-skills](https://library-skills.io) convention): a single `shiny-for-python` skill whose `SKILL.md` is a grouped index that routes coding agents to a per-topic reference file for each of shiny's public APIs. (#2339, #2344, #2345, #2356, #2365, #2366)
+  * Foundations: `reactivity` (the reactive graph — `reactive.value`/`calc`/`effect`/`event`, `req`, `isolate`, `poll`), `express` (Express mode), `modules-core` / `modules-express` (reusable namespaced components), and `session-lifecycle` (`on_ended`/`on_flush`, request info, dynamic routes).
+  * Layout and navigation: `layouts` (pages, cards, sidebars, columns, value boxes), `navigation` (navsets and `page_navbar`), `dynamic-ui` (`@render.ui`, `update_*`, `insert_ui`, `panel_conditional`), and `theming` (`ui.Theme`, presets, dark mode).
+  * Outputs and rendering: `plots` (`render.plot`/`render.image` and interactions), `data-frames` (`render.data_frame`), and `files` (upload/download).
+  * Feedback and interactivity: `feedback` (notifications, modals, progress, busy indicators), `extended-tasks` (non-blocking long-running work), and `bookmarking` (save/restore app state with `bookmark_store=` and `session.bookmark` hooks).
+  * Generative AI: `chat` (`ui.Chat`) and `markdown-streaming` (`ui.MarkdownStream`).
+  * Extending shiny: `custom-renderers` (authoring a `Renderer` subclass) and `custom-components` (custom JavaScript input/output bindings).
+  * Testing and observability: `testing` (end-to-end tests with pytest and Playwright), `debugging` (inspect running apps via test mode), and `otel` (OpenTelemetry observability).
+
+* `shiny skills list` shows each bundled skill's name and description, and `shiny skills path <name>` prints the skill's directory, so its `SKILL.md` and supporting files (`references/`, `scripts/`) can be read from the installed package. To install the skills into a coding agent, the README and the `shiny skills` CLI help now point at [`library-skills`](https://library-skills.io) (`uvx library-skills --claude`). (#2340, #2367)
+
+### Improvements
+
+* The `shiny[otel]` optional dependency group now includes `opentelemetry-distro[otlp]`, so OpenTelemetry zero-code auto-instrumentation works out of the box: `opentelemetry-instrument shiny run app.py`. This is now the documented standard way to enable OpenTelemetry — the docs and the `examples/open-telemetry/` example no longer configure providers inside the app (in-code `set_tracer_provider()` setup is silently ignored when a provider is already installed, e.g. under `opentelemetry-instrument`). The OTLP exporters are also included, making it easy to switch between gRPC and HTTP export via standard `OTEL_*` environment variables. Note that `opentelemetry-distro` pins `opentelemetry-sdk` to a matching minor version, so if you combine `shiny[otel]` with other packages that pin the OpenTelemetry SDK (e.g. `logfire`), the resolver may need matching versions. (#2349)
+
+* The Playwright controllers `DownloadButton` and `DownloadLink` now share a common base class and gain `expect_label()`, and `DownloadLink` gains the width expectations previously available only on `DownloadButton`. (#2093)
+
+* `OutputDataFrame.set_filter()` now supports multi-column filters. (#2093)
+
+### Deprecations
+
+* `@render.download` is deprecated; use `@render.download_button` (or `@render.download_link`) instead. (#2364)
+
+### Bug fixes
+
+* Fixed rare tabset ID collisions in pages with many navsets. Randomly generated `data-tabsetid` values were drawn from a pool of ~1 million, so a page with dozens of tabsets could occasionally produce two navsets with the same ID (a birthday collision), resulting in duplicate DOM ids and broken tab switching. IDs are now drawn from a pool of 9 trillion. (#2296)
+
+* `shiny run --launch-browser` now opens the browser even when Uvicorn's INFO-level startup logs are unavailable, e.g. when logs are disabled or `--log-level=warning` is used. (#569)
+
+* `InputSlider.set()` and `InputSliderRange.set()` now compute the target value's position from the slider's step configuration and drag the handle directly to it, verifying the landing position against the widget's state (finishing with arrow-key presses when the slider has more steps than the track has pixels). Previously the handle was swept one pixel at a time while polling the label, which was slow and could intermittently miss the target when the browser coalesced or dropped mouse-move events (a recurring webkit CI flake). `InputSliderRange.set()` orders the two handle moves so neither is clamped by its sibling, instead of parking both handles at their extremes first. Setting a value the slider cannot produce now raises an error listing the slider's actual values. (#2311, #2326)
+
+* `ui.output_data_frame()` now consistently orders the filtered columns in ascending column order (#2093), and resetting a numeric range filter resets both values (#2093).
+
+* `@render.data_frame` now renders (and patches edits into) data frames whose column names are not strings, e.g. the integer labels pandas assigns by default. Previously a numeric column name was interpreted as a positional row lookup, and rendering failed with `AttributeError: 'DataFrame' object has no attribute 'dtype'`. (Thanks, @eeshsaxena!) (#2115)
+
+* `render.CellValue` now includes the non-string JSON scalars (`int`, `float`, `bool`, `None`) in addition to HTML-like content. A `@<data_frame>.set_patch_fn` that coerces the browser's string to its column's type — as the `data_frame_data_view` example does with `int()` and `float()` — was correct at runtime but reported as a type error. (Thanks, @eeshsaxena!) (#2115)
+
+* `value_box()`'s `id` docstring now documents `input.<id>_full_screen()` for observing the value box's full screen state, matching `card()`. It previously documented the wrong reactive-value syntax, `input.<id>()["full_screen"]`. (#2324)
+
+### Other changes
+
+* CI now runs the unit tests on Ubuntu with the oldest supported Python (3.10) and every runtime dependency resolved to its declared minimum version (via `uv pip compile --resolution lowest-direct`), so stale lower bounds in `pyproject.toml` are caught. As part of this, `starlette` and `prompt-toolkit` gained explicit lower bounds (`>=0.17.1` and `>=3.0.0`), and the `opentelemetry-api`/`opentelemetry-sdk` minimums were raised from 1.20.0 to 1.24.0 — older versions could leak unsanitized error messages in span exception stack traces. Shiny's OpenTelemetry log emission (which relied on the `Logger.emit()` keyword form added in opentelemetry 1.38.0 and was silently dropped on older versions) now falls back to constructing the `LogRecord` manually, so it works across the whole supported range. (#2335)
+
+* Optimized the test suite by avoiding network-based dataset downloads and heavy library imports during Playwright test app startup, reducing setup time significantly. (#2314)
+
+* Packaging metadata now uses a PEP 639 SPDX license expression instead of the deprecated `license` table and license classifier, and stale `MANIFEST.in` rules were removed. Building the package (e.g. with `uv build`) no longer emits setuptools deprecation or manifest warnings. Wheel and sdist contents are unchanged. (#2304)
+
+* Raised the minimum supported uvicorn version from 0.16.0 to 0.23.0 (July 2023). The old floor no longer worked in practice: running on Posit Workbench passes uvicorn the `ws_per_message_deflate` option, which requires uvicorn >= 0.17. (#2317)
+
+* `@add_example()` gained an `example_name=` parameter that looks up the example in the nearest `api-examples/` directory, and all `ex_dir=` call sites that pointed inside an `api-examples/` tree were migrated to it; `ex_dir=` remains only for examples outside the nearest `api-examples/` tree. This also fixed nine call sites that passed the example name positionally, where it was silently treated as `app_file=` and the example was missing from the generated docs (#2328). Docs builds now fail when an `@add_example()` API reference is missing its example app, instead of emitting a warning and silently omitting the example; several APIs whose examples had gone missing this way were fixed, and missing Shiny Express examples were added. (Thanks, @EltonChang1!) (#2278)
+
+* Added api-examples for `shiny.testmode.export_test_values()`, `shiny.testmode.snapshot_preprocess_input()`, and `Renderer.snapshot_preprocess()`, demonstrating how to surface reactive values in the test-mode snapshot and how to scrub sensitive or nondeterministic input/output values from it (#2284), and for `ui.output_code()` (#2093).
+
+* `shiny.run.run_shiny_app()` (and therefore `shiny.pytest.create_app_fixture()`) now picks random app ports from a disjoint per-worker port range when running under pytest-xdist, instead of the full 1024-49151 range shared by all workers. This prevents parallel test workers from racing to bind the same port and from reusing each other's recycled ports. When not running under pytest-xdist, the behavior is unchanged: ports are picked from `random_port()`'s full default range (1024-49151). (#2297)
+
+## [1.6.4] - 2026-07-28
+
+### Bug fixes
+
+* Fixed a path-traversal vulnerability in bookmark restore (CWE-22). Introduced in 1.4.0. Reported by @0xRenSec.
+
+* When bookmarked state cannot be restored, the notification shown in the client is now a generic message. The reason is logged server-side as a warning on the `shiny.bookmark._restore_state` logger, so app authors can still see it. (ab10e069)
+
+### Bug fixes
+
+* Fixed `session.user` and `session.groups` raising `AttributeError` in module sessions (`SessionProxy`) and Express apps (`ExpressStubSession`). Both now correctly return the authenticated user's identity from the root session. As part of this fix, `user` and `groups` are now read-only properties on the `Session` ABC — app code can no longer accidentally overwrite credentials that are derived from immutable HTTP headers. (#2276)
+
+## [1.6.3] - 2026-06-01
+
+### New features
+
+* `session.destroy()` now accepts an optional module `id`. The parent that inserted a module's UI under an `id` can tear down that module's scope with `session.destroy(id)`, without the module having to hand back a cleanup handle. (#2264)
+
+* Added the `brite` theme preset, available wherever Shiny theme presets are accepted (e.g. `ui.Theme()` and `ui.page_*(theme=)`). (#2246)
+
+### Bug fixes
+
+* Fixed output resize/visibility detection for nested HTML outputs. The `IntersectionObserver` now observes the nearest non-`shiny-html-output` ancestor, so the native-observer pipeline introduced in 1.6.1 works correctly when outputs are nested inside other dynamic UI. (#2246)
+
+* Fixed `ui.input_submit_textarea()` failing inside module namespaces. The internal submit button's ID was built from the already-resolved (namespaced) textarea ID, causing a double-namespace when `input_task_button` resolved it again. (#2262)
+
+
+## [1.6.2] - 2026-05-21
+
+### Bug fixes
+
+* Adapted py-shiny to the `htmltools` 0.7.0 sibling-classes refactor. No runtime behavior change. (#2244)
+
+* Bumped `lodash`/`lodash-es` to `4.18.1` in the `js-react` template lockfile for CVE-2025-13465. (#2233)
+
+* Fixed `render.DataGrid()` column headers and hovered rows not adapting to dark mode when `ui.input_dark_mode()` is enabled. The data grid now uses Bootstrap 5.3 mode-aware color tokens (`--bs-tertiary-bg`, `--bs-primary-bg-subtle`, `--bs-emphasis-color`, `--bs-secondary-color`), with the legacy values preserved as fallbacks. (#1635)
+
+## [1.6.1] - 2026-05-01
+
+### New features
+
+* Added `session.destroy()` and `session.on_destroy()` for cleaning up reactive objects (effects, calcs, values) when dynamically inserted module UI is removed. Calling `session.destroy()` on a module's session fires all registered destroy callbacks, which stop effects, invalidate calcs and values, and remove namespaced inputs and outputs from the reactive graph. Reactive objects automatically register weak destroy callbacks so they can be garbage collected when no longer referenced, even before session end. (#2209)
+
+### Improvements
+
+* `@reactive.calc`, `@reactive.effect`, and render decorators (e.g. `@render.text`) now raise a `TypeError` if the decorated function has required parameters, since Shiny never supplies arguments to these functions. Functions with default parameter values emit a warning, as the defaults will always be used. (Thanks, @mvanhorn!) (#2200)
+
+* Output resize/visibility detection now uses native browser observers (`ResizeObserver`, `IntersectionObserver`) instead of relying on jQuery `shown`/`hidden` events and `window.resize`. This makes Shiny's client-side output-info pipeline (image/plot sizing, hidden-state tracking, theme reporting) work automatically in any layout — including CSS-only show/hide, third-party tab components, and non-Bootstrap frameworks — without requiring custom event hooks. This also introduces a `shiny:themechange` event for code that needs to trigger theme clientdata refreshes after changing surrounding visual theme context. (rstudio/shiny#3682)
+
+* `panel_conditional()` no longer briefly flashes its contents on app start
+  when the condition is initially `False`. (rstudio/shiny#3505)
+
+### Bug fixes
+
+* Fixed server-side input deduplication so that all values received from the client always trigger reactive invalidation. (#1600, #2219)
+
+* Fixed a caret drift issue in `ui.input_code_editor()` where the cursor would appear to the right of the actual text insertion point when certain themes or on some operating systems. (#2223)
+
+* Fixed OpenTelemetry name inference for `reactive.Value` to handle type-annotated assignments (e.g., `counter: reactive.Value[int] = reactive.Value(0)`), generic subscript calls (e.g., `reactive.Value[int](0)`), and multiline assignments where the `Value()` call is on a continuation line (e.g., assignments split across lines with parentheses or multiline type annotations). This fixes anonymous OTel labels for packages like `shinychat` that use multiline `reactive.Value` assignments. (#2205)
+
+
+## [1.6.0] - 2026-03-20
+
+### OpenTelemetry
+
+* Added the `SHINY_OTEL_COLLECT` environment variable to set the default collection level globally. Available levels: (#2143)
+  * `"none"` - Disables all Shiny-specific telemetry collection. Use this for sensitive operations where you don't want Shiny to emit any spans or logs.
+  * `"session"` - Captures session lifecycle spans that track when user sessions are starting and ending. This provides basic visibility into session activity without detailed reactive execution information.
+  * `"reactive_update"` - Captures everything from `"session"` plus reactive flush cycle spans that show when reactive invalidation and re-execution occurs. This helps identify performance bottlenecks in reactive updates without the overhead of per-reactive-component instrumentation.
+  * `"reactivity"` - Captures everything from `"reactive_update"` plus individual reactive execution spans (`reactive.calc`, `reactive.effect`, `extended_task`), info-level logs for reactive value updates (including source file, line number, and column position), and debug-level logs for extended task queue operations. This provides comprehensive visibility into reactive execution flow and timing.
+  * `"all"` \[Default\] - Currently equivalent to `"reactivity"` and represents the most comprehensive telemetry available. This is the default collection level when `SHINY_OTEL_COLLECT` is not set (or is explicitly set to `all`).
+
+* Added `otel.suppress` and `otel.collect` to control Shiny's internal OpenTelemetry instrumentation per-function or per-block. Use `@otel.suppress` / `@otel.collect` (no-parens decorators) to stamp a single function, or `with otel.suppress():` / `with otel.collect():` (context managers) to control telemetry during reactive object creation. `otel.suppress` disables Shiny's internal reactivity telemetry; `otel.collect` re-enables reactivity telemetry when the global default has been lowered. Both only affect Shiny's internal spans — user-defined OpenTelemetry spans are unaffected. (#2143)
+
+* Added OpenTelemetry example application (`examples/open-telemetry/`) demonstrating console exporter, collection control with `@otel.suppress` and `@otel.collect`, and side-by-side comparison of normal, suppressed, and force-enabled telemetry. The OpenTelemetry SDK is available via the optional `[otel]` dependency group: `pip install shiny[otel]`. Note: If you're already using an observability package with OpenTelemetry integration (e.g., `logfire`), it likely already includes `opentelemetry-sdk`, so you may not need to explicitly install the `[otel]` group. (#2143)
+
+### New features
+
+* Added toolbar component with `ui.toolbar()`, `ui.toolbar_input_button()`, `ui.toolbar_input_select()`, `ui.toolbar_divider()`, `ui.toolbar_spacer()`, `ui.update_toolbar_input_button()`, and `ui.update_toolbar_input_select()`. Toolbars are compact UI containers designed for small form elements suitable for card headers, footers, and other constrained spaces. They support flexible alignment (left/right), custom spacing and width, icon-only or labeled buttons with optional tooltips, select inputs with grouped choices, visual dividers for separating elements, and flexible spacers for split layouts. Server-side updates allow dynamic modification of button and select properties. (#2155)
+
+* Added a new `ui.input_code_editor()` element that allows for light-weight code editing with syntax highlighting, using the [prism-code-editor](https://prism-code-editor.netlify.app/) library. The editor supports 20+ languages, more than a dozen themes, and automatic light/dark mode switching. (#2128)
+
+### Improvements
+
+* Reduced installed package size by ~400KB by excluding `api-examples/` directories from wheel and source distributions. These examples are only needed when building documentation from the source repository. (#2126)
+
+* Improved reactive value name inference to support all import styles: `reactive.Value()`, `reactive.value()`, `Value()`, and `value()` now all correctly infer variable names for better OpenTelemetry log messages. (#2178)
+
+* Enhanced OpenTelemetry source reference attributes by adding `code.column.number` to track the column position of reactive value updates alongside existing file path, line number, and function name. (#2178)
+
+* Improved OpenTelemetry collection level handling: reactive values now capture the collection level at initialization time (matching behavior of `Calc` and `Effect`), ensuring consistent telemetry behavior throughout the value's lifetime. (#2178)
+
+### Other changes
+
+* Updated `palmerpenguins` dependency to version `>=0.1.5` to include type stubs, removing the need for type ignore comments in tests. (#2157)
+
+## [1.5.1] - 2025-12-08
+
+### New features
+
+* Added toast notification system with `ui.toast()`, `ui.toast_header()`, `ui.show_toast()`, and `ui.hide_toast()`. Toast notifications are temporary, non-intrusive messages that support multiple semantic types (success, warning, error, etc.), flexible positioning (9 positions: top/middle/bottom × left/center/right), auto-hide with configurable duration, optional headers with icons, and programmatic control. (#2111)
+
+* Added a new `input_submit_textarea()` input element, which is similar to `input_text_area()`, but includes a submit button to only submit the text changes to the server on click. This is especially useful when the input text change triggers a long-running operation and/or the user wants to type longer-form input and review it before submitting it. (#2099)
+
+### Bug fixes
+
+* Fixed `ui.tooltip()`'s `options` parameter to properly pass Bootstrap tooltip options to the underlying web component. (#2101)
+
+* Fixed an issue where `session.bookmark()` would error when non-existent `input` values are read. (#2117)
+
+* Revised `accordion()`'s `open` logic to close all panels when an empty list is passed. (#2109)
+
+## [1.5.0] - 2025-09-11
+
+### New features
+
+* Added AI-powered test generator for Shiny applications. Use `shiny add test` to automatically generate comprehensive Playwright tests for your apps using AI models from Anthropic or OpenAI. (#2041)
+
+* `ui.sidebar()` is now interactively resizable. (#2020)
+
+* `ui.sidebar()` gains a `fillable` argument to support vertical fill behavior in sidebars. (#2077)
+
+* Added `ui.insert_nav_panel()`, `ui.remove_nav_panel()`, and `ui.update_nav_panel()` to support dynamic navigation. (#90)
+
+* `navset_card_*()` now gains a `full_screen` option. (#1451)
+
+* `ui.update_*()` functions now accept `ui.TagChild` (i.e., HTML) as input to the `label` and `icon` arguments. (#2020)
+
+* The `.output_*()` methods of the `ClientData` class (e.g., `session.clientdata.output_height()`) can now be called without an `id` when called inside a `@render` function. (#1978)
+
+* `playwright.controller.InputActionButton` gains a `expect_icon()` method. As a result, the already existing `expect_label()` no longer includes the icon. (#2020)
+
+### Breaking changes
+
+* The `ui.Chat` and `ui.MarkdownStream` components are now imported from the new `shinychat` library. Future versions of `shinychat` will likely deprecate and remove some features from `Chat`. If you still want to use those features with the latest Shiny, we suggest pinning `shinychat` to it's initial release (v0.1.0). (#2051)
+
+* `express.ui.insert_accordion_panel()`'s function signature has changed to be more ergonomic. Now you can pass the `panel_title` and `panel_contents` directly instead of `ui.hold()`ing the `ui.accordion_panel()` context manager. (#2042)
+
+### Improvements
+
+* Improved the styling and readability of markdown tables rendered by `ui.Chat()` and `ui.MarkdownStream()`. (#1973)
+
+* `input_date()`, `input_date_range()`, `update_date()`, and `update_date_range()` now support `""` for values, mins, and maxes. In this case, no date will be specified on the client. (#1713) (#1689)
+
+* Restricted the allowable types of the `choices` parameter of `input_select()`, `input_selectize()`, `update_select()`, and `update_selectize()` to actual set of allowable types (previously, the type was suggesting HTML-like values were supported). (#2048)
+
+* Added module support for `session.clientdata` methods. This allows you to access client data values in Shiny modules without needing to namespace the keys explicitly. (#1978)
+
+* Added `timeout_secs` parameter to `create_app_fixture` to allow testing apps with longer startup times. (#2033)
+
+* Add support for selecting menu items in `Navset` controllers to improve dropdown navigation test coverage. (#2066)
+
+* Python 3.13 is now offically supported and tested. (#1711)
+
+### Bug fixes
+
+* Fixed issue where apps run in Workbench were unexpectedly crashing. Apps running in Workbench will now have `ws_per_message_deflate=False` enforced. (#2005)
+
+* `include_js()` and `include_css()` now work as expected in multi-user settings and also when multiple files from the same directory are included. (#2061, #2069)
+
+* Fixed numerous issues related to programmatically updating selectize options. (#2053)
+   * `update_selectize(options=...)` no longer gets ignored when `server=False` (the default).
+   * `update_selectize(options=...)` now works as expected in a module.
+
+* Fixed an issue with `update_selectize(server=True)` not properly displaying labels with HTML reserved characters like "&" (#1330)
+
+* Fixed an issue with `ui.Chat()` sometimes wanting to scroll a parent element. (#1996)
+
+* Fix several issues with bookmarking error reporting and documentation. (#2076, #1984, #1983)
+
+* `input_date()` and `input_date_range()` once again use the client's (not the server) current date as the default `value`. (#2060)
+
+* Fixed false positive warning in `layout_columns()` about number of widths vs elements. (#1704)
+
+* Fixed `set()` method of the `InputSelectize` test controller so it clears existing selections before applying new values. (#2024)
+
+### Deprecations
+
+* `ui.update_navs()` is deprecated in favor of `ui.update_navset()`. (#2047)
+
+* `ui.panel_well()` is deprecated in favor of `ui.card()`. (#2038)
+
+* `selectize`, `remove_button`, and `options` parameters of `ui.input_select()` have been deprecated; use `ui.input_selectize()` instead. (Thanks, @ErdaradunGaztea!) (#1947)
+
+## [1.4.0] - 2025-04-08
+
+### New features
+
+* Added support for bookmarking Shiny applications. Bookmarking allows users to save the current state of an application and return to it later. This feature is available in both Shiny Core and Shiny Express. (#1870, #1915, #1919, #1920, #1922, #1934, #1938, #1945, #1955)
+  * To enable bookmarking in Express mode, set `shiny.express.app_opts(bookmark_store=)` during the app's initial construction.
+  * To enable bookmarking in Core mode, set `shiny.App(bookmark_store=)` when constructing the `app` object.
+
+* Added a new `.enable_bookmarking(client)` method to `ui.Chat()`. This method will attach bookmark hooks to save and restore the chat's messages and client state. (#1951, #1954)
+
+* Both `ui.Chat()` and `ui.MarkdownStream()` now support the inclusion of Shiny UI elements inside of messages. This allows for gathering input from the user (e.g., `ui.input_select()`), displaying of rich output (e.g., `render.DataGrid()`), and more. (#1868)
+
+* Added a new `.message_stream_context()` method to `ui.Chat()`. This context manager is a useful alternative to `.append_message_stream()` when you want to: (1) Nest a stream within another and/or (2) Overwrite/replace streaming content. (#1906)
+
+### Changes
+
+* Express mode's `app_opts()` requires all arguments to be keyword-only. If you are using positional arguments, you will need to update your code. (#1895)
+
+* The `.get_latest_stream_result()` method on `ui.MarkdownStream()` was deprecated in favor of the new `.latest_stream` property. Call `.result()` on the property to get the latest result, `.status` to check the status, and `.cancel()` to cancel the stream.
+
+* `MarkdownStream()` now has a default maximum width of `680px` for better readability. Also, similar to `Chat()`, it now also horizontally centers itself. (#1944)
+
+* `ui.page_navbar()` and `ui.navset_bar()` now correctly apply `theme` and additional attributes from `navbar_options` created with `ui.navbar_options()`. (#1942)
+
+### Bug fixes
+
+* Fixed an issue where the `<main>` areas of `ui.page_sidebar()` and `ui.page_navbar()` (with a `sidebar`) were made to be a fillable containers even when `fillable=False`. (#1816)
+
+* Fixed an issue where the `.update_user_input()` method on `ui.Chat()` isn't working in shinylive.  (#1891)
+
+* Fixed an issue where `width` and `height` on `MarkdownStream()` were not working as intended. (#1944)
+
+* Fixed an issue with the `.click()` method on InputActionButton controllers in `shiny.playwright.controllers` where the method would not work as expected. (#1886)
+
+## [1.3.0] - 2025-03-03
+
+### New features
+
+* Added a new `ui.MarkdownStream()` component for performantly streaming in chunks of markdown/html strings into the UI. This component is primarily useful for text-based generative AI where responses are received incrementally. (#1782)
+
+* The `ui.Chat()` component now supports input suggestion links. This feature is useful for providing users with clickable suggestions that can be used to quickly input text into the chat. This can be done in 2 different ways (see #1845 for more details):
+  * By adding a `.suggestion` CSS class to an HTML element (e.g., `<span class="suggestion">A suggestion</span>`)
+  * Add a `data-suggestion` attribute to an HTML element, and set the value to the input suggestion text (e.g., `<span data-suggestion="Suggestion value">Suggestion link</span>`)
+  * To auto-submit the suggestion when clicked by the user, include the `.submit` class or the `data-suggestion-submit="true"` attribute on the HTML element. Alternatively, use Cmd/Ctrl + click to auto-submit any suggestion or Alt/Opt + click to apply any suggestion to the chat input without submitting.
+
+* The `ui.Chat()` component also gains the following:
+    * The `.on_user_submit()` decorator method now passes the user input to the decorated function. This makes it a bit easier to access the user input. See the new templates (mentioned below) for examples. (#1801)
+    * The assistant icon is now configurable via `ui.chat_ui()` (or the `ui.Chat.ui()` method in Shiny Express) or for individual messages in the `.append_message()` and `.append_message_stream()` methods of `ui.Chat()`. (#1853)
+    * A new `latest_message_stream` property was added for an easy way to reactively read the stream's status, result, and also cancel an in progress stream. (#1846)
+    * The `.append_message_stream()` method now returns the `reactive.extended_task` instance that it launches. (#1846)
+    * The `ui.Chat()` component's `.update_user_input()` method gains `submit` and `focus` options that allow you to submit the input on behalf of the user and to choose whether the input receives focus after the update. (#1851)
+
+* `shiny create` includes new and improved `ui.Chat()` template options. Most of these templates leverage the new [`{chatlas}` package](https://posit-dev.github.io/chatlas/), our opinionated approach to interfacing with various LLM. (#1806)
+
+* Client data values (e.g., url info, output sizes/styles, etc.) can now be accessed in the server-side Python code via `session.clientdata`. For example, `session.clientdata.url_search()` reactively reads the URL search parameters. (#1832)
+
+* Available `input` ids can now be listed via `dir(input)`. This also works on the new `session.clientdata` object. (#1832)
+
+* `ui.input_text()`, `ui.input_text_area()`, `ui.input_numeric()` and `ui.input_password()` all gain an `update_on` option. `update_on="change"` is the default and previous behavior, where the input value updates immediately whenever the value changes. With `update_on="blur"`, the input value will update only when the text input loses focus or when the user presses Enter (or Cmd/Ctrl + Enter for `ui.input_text_area()`). (#1874)
+
+* Added a new `.add_sass_layer_file()` method to `ui.Theme` that supports reading a Sass file with layer boundary comments, e.g. `/*-- scss:defaults --*/`. This format [is supported by Quarto](https://quarto.org/docs/output-formats/html-themes-more.html#bootstrap-bootswatch-layering) and makes it easier to store Sass rules and declarations that need to be woven into Shiny's Sass Bootstrap files. (#1790)
+
+* Added a new `expect_max_height()` method to the Valuebox controllers to check the maximum height of a value box (#1816)
+
+* `shiny.pytest.create_app_fixture(app)` gained support for multiple app file paths when creating your test fixture. If multiple file paths are given, it will behave as a parameterized fixture value and execute the test for each app path. (#1869)
+
+### Breaking changes
+
+* The navbar-related style options of `ui.page_navbar()` and `ui.navset_bar()` have been consolidated into a single `navbar_options` argument that pairs with a new `ui.navbar_options()` helper. Using the direct `position`, `bg`, `inverse`, `collapsible`, and `underline` arguments will continue to work with a deprecation message. (#1822)
+
+  Related to this change, `ui.navset_bar()` now defaults to using `underline=True` so that it uses the same set of default `ui.navbar_options()` as the page variant. In `ui.navbar_options()`, `inverse` is replaced by `theme`, which takes values `"light"` (dark text on a **light** background), `"dark"` (light text on a **dark** background), or `"auto"` (follow page settings).
+
+* The Shiny Core component `shiny.ui.Chat()` no longer has a `.ui()` method. This method was never intended to be used in Shiny Core (in that case, use `shiny.ui.chat_ui()`) to create the UI element. Note that the `shiny.express.ui.Chat()` class still has a `.ui()` method. (#1840)
+
+### Bug fixes
+
+* `ui.Chat()` now correctly handles new `ollama.chat()` return value introduced in `ollama` v0.4. (#1787)
+
+* Updated `expect_height()` for Valuebox controllers to check the height property instead of max-height. (#1816)
+
+## [1.2.1] - 2024-11-14
+
+### Bug fixes
+
+* Branded theming via `ui.Theme.from_brand()` now correctly applies monospace inline and block font family choices. (#1762)
+
+* Compatibility with `websockets>=14.0`, which has changed its public APIs. Shiny now requires websockets 13 or later. (#1769)
+
+
+## [1.2.0] - 2024-10-29
+
+### Breaking changes
+
+* `.expect_inverse()` for Navset controllers in `shiny.playwright.controllers` now requires a `bool` value. To keep behavior the same, use `.expect_inverse(False)`. (#1668)
+
+* `.expect_layout()` for Navset controllers in `shiny.playwright.controllers` is now renamed to `.expect_fluid()` and requires a `bool` value. To keep behavior the same, use `.expect_fluid(True)`. (#1668)
+
+* `.expect_icon()` for Accordion controllers in `shiny.playwright.controllers` now requires a `bool` value instead of a `str`. (#1710)
+
+### New features
+
+* New features for `@render.data_frame`:
+
+  * Added [narwhals](https://posit-dev.github.io/py-narwhals) support for `@render.data_frame`. This allows for any eager data frame supported by narwhals to be returned from a `@render.data_frame` output method. All internal methods and helper methods now leverage the `narwhals` API to be data frame agnostic. (#1570)
+
+  * Added `.data_patched()` reactive calculation that applies all `.cell_patches()` to `.data()`. (#1719)
+
+  * Added `.update_cell_value()` method to programmatically update the contents of a data frame cell. (#1719)
+
+  * Added `.update_data()` method to update the rendered data without resetting any user sort or filter. Note, all user edits will be forgotten. (#1719)
+
+* Added [narwhals](https://posit-dev.github.io/py-narwhals) support for `@render.table`. This allows for any eager data frame supported by narwhals to be returned from a `@render.table` output method. (#1570)
+
+* Shiny now supports theming via [brand.yml](https://posit-dev.github.io/brand-yml) with a single `_brand.yml` file. Call `ui.Theme.from_brand()` with `__file__` or the path to a `_brand.yml` file and pass the resulting theme to the `theme` argument of `express.ui.page_opts()` (Shiny Express) or `ui.page_*()` functions (Shiny Core) to apply the brand theme to the entire app. (#1743)
+
+* `chat_ui()` and `Chat.ui()` gain a `messages` parameter for providing starting messages. (#1736)
+
+### Other changes
+
+* Incorporated `orjson` for faster data serialization in `@render.data_frame` outputs. (#1570)
+
+* Added `PageNavbar` class to the list of `shiny.playwright.controllers` for testing `ui.page_navbar()`. (#1668)
+
+* Added `.expect_widths()` to `NavsetPillList` in `shiny.playwright.controllers` for testing `ui.navset_pill_list(widths=)`. (#1668)
+
+* Added `.expect_title()` for `Popover` in `shiny.playwright.controllers` (#1683)
+
+* Added `.expect_disabled()` for `InputActionButton` in `shiny.playwright.controllers` (#1705)
+
+* Small improvements to the default pulse busy indicator to better blend with any background. It's also now slightly smaller by default.(#1707)
+
+* Added `.expect_class()`, `.expect_gap()`, `.expect_bg_color()`, `.expect_desktop_state()`, `.expect_mobile_state()`, `.expect_mobile_max_height()`, `.expect_title()`, and `.expect_padding()` for `Sidebar` in `shiny.playwright.controllers` (#1715)
+
+* Modified `.expect_text()` for `Sidebar` in `shiny.playwright.controllers` to use `.loc_content` instead of `loc` for text. Also modified `.expect_width()` to check the `.loc_container`'s style instead of the `.loc` element. (#1715)
+
+* Modified `.expect_text()` and `.expect_width()` for `Sidebar` in `shiny.playwright.controllers` to use `loc_content` instead of `loc` for text. (#1715)
+
+* Added `.expect_class()` and `.expect_multiple()` for `Accordion` in `shiny.playwright.controllers` (#1710)
+
+### Bug fixes
+
+* A few fixes for `ui.Chat()`, including:
+  * Fixed a bug with `Chat()` sometimes silently dropping errors. (#1672)
+  * Fixed a bug with `Chat()` sometimes not removing it's loading icon (on error or a `None` transform). (#1679)
+  * `.messages(format="anthropic")` correctly removes non-user starting messages (once again). (#1685)
+
+* `shiny create` now uses the template `id` rather than the directory name as the default directory. (#1666)
+
+* `ui.Theme()` now works correctly on Windows when the theme requires Sass compilation. (Thanks, @yuuuxt!) (#1684)
+
+* Fixed multiple input controllers (`InputSlider`, `InputDate`, `InputDateRange`, `InputCheckbox`, and `InputCheckboxGroup`) in `shiny.playwright.controller` to check the `width` property within the `style` attribute. (#1691, #1696, #1702)
+
+* Fixed multiple input controllers (`InputSwitch`, `InputRadioButtons`, `InputNumeric`, `InputText`, `InputTextArea`, `InputPassword`, `InputActionButton`, and `InputActionLink`) in `shiny.playwright.controller` to correctly validate the `width` style property in `.expect_width(). (#1705)
+
+* Fixed input controller `InputTextArea` in `shiny.playwright.controller` to correctly validate the `resize` style property in `.expect_resize()`. (#1705)
+
+* Fixed a bug in `ui.conditional_panel()` that would cause the panel to repeatedly show/hide itself when the provided condition did not evaluate to a boolean value. (#1707)
+
+* Fixed a bug with `ui.input_slider()` when used as a range slider that made it impossible to change the slider value when both handles were at the maximum value. (#1707)
+
+* Fixed bug in `@render.data_frame` where `bool` or `object` columns were not being rendered. (#1570)
+
+* Fixed output controller `OutputDataFrame` in `shiny.playwright.controller` to correctly assert the number of rows in `.expect_nrow()` as the total number of virtual rows, not the number of currently displaying rows. (#1719)
+
+* Fixed issue where `@render.download` did not respect the module namespacing. (Thanks, @nsiicm0!) (#1732)
+
+* Added workaround in `Accordion` in `shiny.playwright.controller` where `.expect_open()` and `.expect_panels()` would hang while resolving a playwright locator. (Thanks, @joesho112358!) (#1165)
+
+## [1.1.0] - 2024-09-03
+
+### New features
+
+* `ui.Chat()` gains a new `.update_user_input()` method, which adds the ability to update the input placeholder message. As a result, `.set_user_message()` is now deprecated (since the new method can also be used to update the message). (#1594)
+
+* `shiny create` now supports a succinct format for specifying the GitHub repository via the `--github` flag, e.g. `--github posit-dev/py-shiny-templates`. You can now also use `--github` and `--template` together, in which case `--github` should point to a repository containing a directory matching the name provided in `--template`. (#1623)
+
+* `shiny create` now identifies templates in external repositories using a `_template.json` metadata file. This file should contain at an `"id"` and optionally a `"title"` and `"description"`. When `shiny create` is called with the `--github` flag but without a `--template` flag, it will offer a menu listing all available templates in the repository. (#1631)
+
+### Other changes
+
+* A few changes for `ui.Chat()`, including:
+  * The `.messages()` method no longer trims messages by default (i.e., the default value of `token_limits` is now `None` instead of the overly generic and conservative value of `(4096, 1000)`). See the new generative AI in production templates (via `shiny create`) for examples of setting `token_limits` based on the model being used. (#1657)
+  * User input that contains markdown now renders the expected HTML. (#1607)
+  * Busy indication is now visible/apparent during the entire lifecycle of response generation. (#1607)
+
+### Bug fixes
+
+* A few fixes for `ui.Chat()`, including:
+  * A fix for use inside Shiny modules. (#1582)
+  * `.messages(format="google")` now returns the correct role. (#1622)
+  * `transform_assistant_response` can now return `None` and correctly handles change of content on the last chunk. (#1641)
+
+* An empty `ui.input_date()` value no longer crashes Shiny. (#1528)
+
+* Fixed bug where calling `.update_filter(None)` on a data frame renderer did not visually reset non-numeric column filters. (It did reset the column's filtering, just not the label). Now it resets filter's label. (#1557)
+
+* Require shinyswatch >= 0.7.0 and updated examples accordingly. (#1558)
+
+* `ui.input_text_area(autoresize=True)` now resizes properly even when it's not visible when initially rendered (e.g. in a closed accordion or a hidden tab). (#1560)
+
+* `ui.notification_show(duration=None)` now persists the notification until the app user closes it. (#1577)
+
+* Some copies of Windows 10 have registry entries mapping .js files to content type "text/plain", which was causing all sorts of problems for browsers. (#1624)
+
+* Added missing support for `express.ui.navset_card_pill(placement:)`. (#1602)
+
+* Added `.expect_sidebar()` and `.expect_title()` methods for `NavsetCardTab`, `NavsetCardPill`, `NavsetCardUnderline`, and `NavsetBar`. (#1602)
+
+* Added `.expect_placement()` method for `NavsetCardPill` and `NavsetCardUnderline`. (#1602)
+
+### Deprecations
+
+## [1.0.0] - 2024-07-18
+
+### New features
+
+* Added a new `shiny.ui.Chat` class for building conversational interfaces with fully customizable and performant response generation. (#1453)
+
+* Expose `shiny.playwright`, `shiny.run`, and `shiny.pytest` modules that allow users to testing their Shiny apps.  (#1448, #1456, #1481)
+  * `shiny.playwright` contains `controller` and `expect` submodules. `controller` will contain **many** classes to interact with (and verify!) your Shiny app using Playwright. `expect` contains expectation functions that enhance standard Playwright expectation methods.
+  * `shiny.run` contains the `run_shiny_app` command and the return type `ShinyAppProc`. `ShinyAppProc` can be used to type the Shiny app pytest fixtures.
+  * `shiny.pytest` contains pytest test fixtures. The `local_app` pytest fixture is automatically available and runs a sibling `app.py` file. Where as `create_app_fixture(PATH_TO_APP)` allows for a relative path to a Shiny app to be instantiated from a different folder.
+
+* Added CLI command `shiny add test` to add a test file to an existing Shiny app. (#1461)
+
+* `@render.data_frame`, `render.DataGrid`, and `render.DataTable` now support `polars` data frames (#1474).
+
+* `@render.data_frame`, `render.DataGrid`, and `render.DataTable` are now type aware. This means that the data frame renderer object's `.data()` and `.data_view()` methods will return the same type of data given the the renderer. E.g. If a `DataGrid` wrapping a `polars` data frame is returned to the renderer function, `.data_view()` will return `polars` data.  (#1502)
+
+* `@render.data_frame`'s `render.DataGrid` and `render.DataTable` added support for cell styling with the new `styles=` parameter. This parameter can receive a style info object (or a list of style info objects), or a function that accepts a data frame and returns a list of style info objects. Each style info object can contain the `rows` and `cols` locations where the inline `style` and/or CSS `class` should be applied. (#1475)
+
+* `@render.data_frame` has added a few new methods:
+  * `.data_view_rows()` is a reactive value representing the sorted and filtered row numbers. This value wraps `input.<ID>_data_view_rows()`(#1374)
+  * `.sort()` is a reactive value representing the sorted column information (dictionaries containing `col: int` and `desc: bool`). This value wraps `input.<ID>_sort()`. (#1374)
+  * `.filter()` is a reactive value representing the filtered column information (dictionaries containing `col: int` and `value` which is either a string or a length 2 array of at least one non-`None` number). This value wraps `input.<ID>_filter()`. (#1374)
+  * `.update_sort(sort=)` allows app authors to programmatically update the sorting of the data frame. (#1374)
+  * `.update_filter(filter=)` allows app authors to programmatically update the filtering of the data frame. (#1374)
+
+* `@render.data_frame` now accepts both a non-`"none"` `selection_mode` value and `editable=True`. (#1454, #1534)
+
+* `@render.data_frame`'s `<ID>.cell_selection()` no longer returns a `None` value and now always returns a dictionary containing both the `rows` and `cols` keys. This is done to achieve more consistent author code when working with cell selection. When the value's `type="none"`, both `rows` and `cols` are empty tuples. When `type="row"`, `cols` represents all column numbers of the data. In the future, when `type="col"`, `rows` will represent all row numbers of the data. These extra values are not available in `input.<ID>_cell_selection()` as they are independent of cells being selected and are removed to reduce information being sent to and from the browser. (#1376)
+
+* Relative imports, like `from . import utils`, now can be used in Shiny Express apps. (#1464)
+
+* `ui.Theme` allows you to create custom themes for your Shiny app by recompiling [Bootstrap](https://getbootstrap.com/) and Shiny's Sass files with your own customizations. Themes created with `ui.Theme` can be passed directly to the `theme` argument of `express.ui.page_opts()` (Shiny Express) or `ui.page_*()` functions (Shiny Core) to apply the theme to the entire app. This feature requires the [libsass package](https://sass.github.io/libsass-python/) which can be installed with `pip install libsass`. (#1358)
+
+* `ui.card_body()` can be used to wrap the contents of elements in `ui.card()`, allowing you to change parameters like `fillable` or `padding` and `gap` for groups of elements in the card. (#1506)
+
+### Other changes
+
+* `ui.input_action_button()` and `ui.update_action_button()` gain a `disabled` argument. When the button is disabled, it appears grayed out and cannot be clicked. (#1465)
+
+* The main content area of `ui.page_sidebar()` and `ui.page_navbar()` with a page-level `sidebar` now have a minimum height and width to avoid squashed content in fillable layouts. The minimum height and width are controllable via `--bslib-page-main-min-{width,height}` CSS variables. (#1436)
+
+* Added a new option to place an always-open sidebar *above the main content* on mobile screens by providing `open={"mobile": "always-above"}` to `ui.sidebar()`. (#1436)
+
+### Bug fixes
+
+* Fixed #1440: When a Shiny Express app with a `www/` subdirectory was deployed to shinyapps.io or a Connect server, it would not start correctly. (#1442)
+
+* Fixed #1498: Update table related TypeScript dependencies to their latest versions. This fixed an issue where the Row Virtualizer would scroll to the end when hidden. This would cause the DOM to update numerous times, locking up the browser tab for multiple seconds. (#1524, #1550)
+
+* The return type for the data frame patch function now returns a list of `render.CellPatch` objects (which support `htmltools.TagNode` for the `value` attribute). These values will be set inside the data frame's `.data_view()` result. This also means that `.cell_patches()` will be a list of `render.CellPatch` objects.  (#1526)
+
+* Made sure all `@render.data_frame` cells that have been edited are now restored back to ready state to handle the off chance that the returned patches are at different locations the the original edit patches. (#1529)
+
+* `remove_all_fill(tag)` no longer modifies the original `tag` input and instead returns a modified copy of `tag`. (#1538)
+
+### Deprecations
+
+* The following deprecated functions have now been removed (#1546):
+  * `shiny.ui.panel_sidebar()` was deprecated in v0.6.0; use `shiny.ui.sidebar()` instead.
+  * `shiny.ui.panel_main()` was deprecated in v0.6.0; instead pass items directly to `shiny.ui.layout_sidebar()`.
+  * `shiny.ui.navset_pill_card()` was deprecated in v0.6.0; use `shiny.ui.navset_card_pill()` instead.
+  * `shiny.ui.navset_tab_card()` was deprecated in v0.6.0; use `shiny.ui.navset_card_tab()` instead.
+  * `shiny.ui.nav()` was deprecated in v0.6.1; use `shiny.ui.nav_panel()` instead.
+
+* `@render.data_frame`, `render.DataGrid`, and `render.DataTable` have deprecated support for data frame types that are `pandas` compatible. Please call `.to_pandas()` on your data before it is returned to the renderer (#1502). Currently, both `polars` and `pandas` data frames are supported (#1474). If you'd like to add support for a new data frame type, please open an issue or a pull request.
+
+* `@render.data_frame`'s `.cell_selection()` will no longer return `None` when the selection mode is `"none"`. In addition, missing `rows` or `cols` information will be populated with appropiate values. This allows for consistent handling of the cell selection object. (#1374)
+
+* `@render.data_frame`'s input value `input.<ID>_data_view_indices()` has been deprecated. Please use `<ID>.data_view_rows()` to retrieve the same information. (#1377)
+
+* `@render.data_frame`'s input value `input.<ID>_column_sort()` has been deprecated. Please use `<ID>.sort()` to retrieve the same information. (#1374)
+
+* `@render.data_frame`'s input value `input.<ID>_column_filter()` has been deprecated. Please use `<ID>.filter()` to retrieve the same information. (#1374)
+
+* Deprecated functions in `shiny.experimental` have been removed. By and large, these functions are now available in the main `shiny` namespace. (#1540)
+
+* We've deprecated several card-related `shiny.experimental.ui` functions that were moved to the main `shiny.ui` namespace in v0.6.0. Both `card()` and `card_body()` are no longer experimental and can be called via `shiny.ui.card()` and `shiny.ui.card_body()` directly. `shiny.experimental.ui.card_title()` is now deprecated, but can be replaced with `shiny.ui.tags.h5()` or `shiny.ui.card_header()`. (#1543)
+
+
+## [0.10.2] - 2024-05-28
+
+### Bug fixes
+
+* Fixed an issue with output spinners only showing for a split second. (#1429)
+
+## [0.10.1] - 2024-05-23
+
+### Bug fixes
+
+* Fixed an issue with opacity dimming occurring too often/quickly when outputs are recalculating. (#1415)
+
+## [0.10.0] - 2024-05-23
+
+### Deprecations
+
+* Restored `@render.data_frame`'s (prematurely removed in v0.9.0) input value `input.<ID>_selected_rows()`. Please use `<ID>.cell_selection()["rows"]` and consider `input.<ID>_selected_rows()` deprecated. (#1345, #1377)
+
+* `@render.data_frame`'s method `.input_cell_selection()` has been renamed to `.cell_selection()`. Please use `.cell_selection()` and consider `.input_cell_selection()` deprecated. (#1407)
+
+### New features
+
+* Added busy indicators to provide users with a visual cue when the server is busy calculating outputs or otherwise serving requests to the client. More specifically, a spinner is shown on each calculating/recalculating output, and a pulsing banner is shown at the top of the page when the app is otherwise busy. Use the new `ui.busy_indicator.options()` function to customize the appearance of the busy indicators and `ui.busy_indicator.use()` to disable/enable them. (#918)
+
+* Added support for creating modules using Shiny Express syntax, and using modules in Shiny Express apps. (#1220)
+
+* `ui.page_*()` functions gain a `theme` argument that allows you to replace the Bootstrap CSS file with a new CSS file. `theme` can be a local CSS file, a URL, or a [shinyswatch](https://posit-dev.github.io/py-shinyswatch) theme. In Shiny Express apps, `theme` can be set via `express.ui.page_opts()`. (#1334)
+
+### Bug fixes
+
+* Fixed an issue that prevented Shiny from serving the `font.css` file referenced in Shiny's Bootstrap CSS file. (#1342)
+
+* Removed temporary state where a data frame renderer would try to subset to selected rows that did not exist. (#1351, #1377)
+
+* Fix an issue in the data frame output which caused the table to freeze when filters removed previously selected cells. (#1412)
+
+### Other changes
+
+* `Session` is now an abstract base class, and `AppSession` is a concrete subclass of it. Also, `ExpressMockSession` has been renamed `ExpressStubSession` and is a concrete subclass of `Session`. (#1331)
+
+* The `Session` class now has a method `is_stub_session()`. For `ExpressStubSession`, this method returns `True` for , and `AppSession` objects it returns `False`. (#1331)
+
+* Closed #1293: The error console would display error messages if an app was disconnected and the user changed an input. (#1339)
+
+* Fixed an issue where some CSS files were larger than necessary because they had source maps embedded in them. (#1339)
+
+## [0.9.0] - 2024-04-16
+
+### Breaking Changes
+
+* `@render.data_frame` return values of `DataTable` and `DataGrid` had their parameter of `row_selection: Literal["single", "multiple"]` become deprecated. Please use `selection_mode="row"` or `selection_mode="rows"` instead. (#1198)
+
+* The `col_widths` argument of `ui.layout_columns()` now sets the `sm` breakpoint by default, rather than the `md` breakpoint. For example, `col_widths=(12, 6, 6)` is now equivalent to `{"sm": (12, 6, 6)}` rather than `{"md": (12, 6, 6)}`. (#1222)
+
+### New features
+
+* `Session` objects now have a `set_message_handler(name, fn)` method that allows you to register a message handler function that will be called when a request message with the given name is received from the client (via `Shiny.shinyapp.makeRequest()` (JS)). (#1253)
+
+* Experimental: `@render.data_frame` return values of `DataTable` and `DataGrid` support `editable=True` to enable editing of the data table cells. (#1198)
+
+* `ui.card()` and `ui.value_box()` now take an `id` argument that, when provided, is used to report the full screen state of the card or value box to the server. For example, when using `ui.card(id = "my_card", full_screen = TRUE)` you can determine if the card is currently in full screen mode by reading the boolean value of `input.my_card_full_screen()`. (#1215, #1266)
+
+* Added support for using `shiny.express` in Quarto Dashboards. (#1217)
+
+* `ui.value_box()`, `ui.layout_columns()` and `ui.layout_column_wrap()` now all have `min_height` and `max_height` arguments. These are useful in filling layouts, like `ui.page_fillable()`, `ui.page_sidebar(fillable=True)` or `ui.page_navbar(fillable=True)`. For example, you can use `ui.layout_columns(min_height=300, max_height=500)` to ensure that a set of items (likely arranged in a row of columns) are always between 300 and 500 pixels tall. (#1223)
+
+* Added an error console which displays errors in the browser's UI. This is enabled by default when running applications locally, and can be disabled with `shiny run --no-dev-mode`. It is not enabled for applications that are deployed to a server. (#1060)
+
+* `shiny create` was updated to include some additional templates as well as an option to choose from the new [templates website](https://shiny.posit.co/py/templates/). (#1273, #1277, #1274)
+
+* `shiny.express.ui.page_opts()` now accepts additional keyword arguments that are passed to the underlying page layout chosen by `shiny.ui.page_auto()`. (#1314)
+
+### Bug fixes
+
+* On Windows, Shiny Express app files are now read in as UTF-8. (#1203)
+
+* `input_dark_mode()` now accepts a `style` argument that can be used to customize the appearance and position of the dark mode toggle switch. (#1207)
+
+* Calling `ui.update_selectize()` with `choices` and `selected` now clears the current selection before updating the choices and selected value. (#1221)
+
+* Fixed an issue that could happen with a `ui.card()` or `ui.value_box()` that is rendered dynamically via `@render.ui` when an updated card replaces a card that the user has expanded into full screen mode. Now the full screen state is reset for the new card or value box. If you want to update a card without potentially exiting the full-screen mode, update specific parts of the card using `ui.output_ui()` or `ui.output_text()`. (#1221)
+
+* `ui.layout_columns()` now correctly applies the `row_heights` at the `xs` breakpoint, if supplied. (#1222)
+
+* `ui.panel_conditional()` now adds the `.shiny-panel-conditional` class to the `<div>` element wrapping the conditional panel contents. (#1257)
+
+* `ui.panel_conditional()` no longer results in unwanted double padding when the parent container uses `gap` for spacing multiple elements (e.g., when used in `ui.layout_columns()`, `ui.page_fillable()`, etc). (#1266)
+
+* Error messages now use `var(--bs-danger)` instead of `var(--bs-danger-text-emphasis)` for the text color. (#1266)
+
+### Other changes
+
+* The fill CSS used by fillable containers (i.e. when `fillable=True`) now uses a [CSS cascade layer](https://developer.mozilla.org/en-US/docs/Learn/CSS/Building_blocks/Cascade_layers) named `htmltools` to reduce the precedence order of the fill CSS. (#1228)
+
+## [0.8.1] - 2024-03-06
+
+### Breaking Changes
+
+* `ui.page_sidebar()` now places the `title` element in a `.navbar` container that matches the structure of `page_navbar()`. This ensures that the title elements of `page_sidebar()` and `page_navbar()` have consistent appearance. (#1176)
+
+### Bug fixes
+
+* Shiny now compiles the Bootstrap 5-based stylesheets for component styles imported from https://github.com/rstudio/shiny. (#1191)
+
+* Fixed the CSS for `ui.output_ui()` to avoid unwanted double padding when its parent container uses `gap` for spacing multiple elements (e.g., `ui.layout_columns()`, `ui.page_fillable()`, etc). (#1176)
+
+### Other changes
+
+* Closed #1178: Removed run-time dependency on asgiref. (#1183)
+
+* The uvicorn and click packages are no longer needed when running on Emscripten. (#1187)
+
+* We adjusted the shadows used for cards and popovers. Cards now use a slightly smaller shadow and the same shadow style is also now used by popovers. (#1176)
+
+* We increased the spacing between elements just slightly. This change is most noticeable in the `layout_columns()` or `layout_column_wrap()` component. In these and other components, you can use `gap` and `padding` arguments to choose your own values, or you can set the `$bslib-spacer` (Sass) or `--bslib-spacer` (CSS) variable. (#1176)
+
+## [0.8.0] - 2024-03-04
+
+### Breaking Changes
+
+* Page-level sidebars used in `ui.page_sidebar()` and `ui.page_navbar()` will now default to being initially open but collapsible on desktop devices and always open on mobile devices. You can adjust this default choice by setting `ui.sidebar(open=)`. (#1129)
+
+* `ui.sidebar()` is now a thin wrapper for the internal `ui.Sidebar` class. The `ui.Sidebar` class has been updated to store the sidebar's contents and settings and to delay rendering until the sidebar HTML is actually used. Because most users call `ui.sidebar()` instead of using the class directly, this change is not expected to affect many apps. (#1129)
+
+### New features
+
+* Added `ui.input_dark_mode()`, a toggle switch that allows users to switch between light and dark mode. By default, when `ui.input_dark_mode()` is added to an app, the app's color mode follows the users's system preferences, unless the app author sets the `mode` argument. When `ui.input_dark_mode(id=)` is set, the color mode is reported to the server, and server-side color mode updating is possible using `ui.update_dark_mode()`. (#1149)
+
+* `ui.sidebar(open=)` now accepts a dictionary with keys `desktop` and `mobile`, allowing you to independently control the initial state of the sidebar at desktop and mobile screen sizes. (#1129)
+
+* Closed #984: In Shiny Express apps, if there is a `"www"` subdirectory in the app's directory, Shiny will serve the files in that directory as static assets, mounted at `/`. (#1170)
+
+* For Shiny Express apps, added `express.app_opts()`, which allows setting application-level options, like `static_assets` and `debug`. (#1170)
+
+* Closed #1079: For Shiny Express apps, automatically run a `globals.py` file in the same directory as the app file, if it exists. The code in `globals.py` will be run with the session context set to `None`. (#1172)
+
+### Bug fixes
+
+* Fixed `input_task_button` not working in a Shiny module. (#1108)
+
+* Fixed several issues with `page_navbar()` styling. (#1124)
+
+* Fixed `Renderer.output_id` to not contain the module namespace prefix, only the output id. (#1130)
+
+* Fixed gap-driven spacing between children in fillable `nav_panel()` containers. (#1152)
+
+* Fixed #1138: An empty value in a date or date range input would cause an error; now it is treated as `None`. (#1139)
+
+### Other changes
+
+* `@render.data_frame` now properly fills its container by default. (#1126)
+
+* We improved the accessibility of the full screen toggle button in cards created with `ui.card(full_screen=True)`. Full-screen cards are now also supported on mobile devices. (#1129)
+
+* When entering and exiting full-screen card mode, Shiny now emits a client-side custom `bslib.card` event that JavaScript-oriented users can use to react to the full screen state change. (#1129)
+
+* The sidebar's collapse toggle now has a high `z-index` value to ensure it always appears above elements in the main content area of `ui.layout_sidebar()`. The sidebar overlay also now receives the same high `z-index` on mobile layouts. (#1129)
+
+* Updated example apps to use lower-case versions of `reactive.Calc`->`reactive.calc`, `reactive.Effect`->`reactive.effect`, and `reactive.Value`->`reactive.value`. (#1164)
+
+* Closed #1081: The `@expressify()` function now has an option `has_docstring`. This allows the decorator to be used with functions that contain a docstring. (#1163)
+
+* Replaced use of `sys.stderr.write()` with `print(file=sys.stderr)`, because on some platforms `sys.stderr` can be `None`. (#1131)
+
+* Replaced soon-to-be deprecated `datetime` method calls when handling `shiny.datetime` inputs. (#1146)
+
+
+## [0.7.1] - 2024-02-05
+
+### Bug fixes
+
+* Fixed `render.download` not working in Express. (#1085)
+
+* `express.ui.hold()` can now accept any type of object, instead of just `TagChild` objects. (#1089)
+
+* Fixed an issue where `input_selectize` would not initialize correctly when created within a Shiny module. (#1091)
+
+
+## [0.7.0] - 2024-01-25
+
+### Breaking Changes
+
+* Closed #938: `page_sidebar()` and `page_navbar()` now use `fillable=False` by default. (#990)
+
+### New features
+
+* Added `shiny.ui.input_task_button()` for creating buttons that launch longer-running tasks than `shiny.ui.input_action_button()` was designed for. Task buttons give visual feedback that the task is running, and cannot be clicked again until the task is complete. (#907)
+
+* Added `@extended_task` decorator for creating long-running tasks that can be cancelled. (#907)
+
+* Added `@render.download` as a replacement for `@session.download`, which is now deprecated. (#977)
+
+* Added `ui.output_code()`, which is currently an alias for `ui.output_text_verbatim()`. (#997)
+
+* Added `@render.code`, which is an alias for `@render.text`, but in Express mode, it displays the result using `ui.output_code()`. (#997)
+
+* Added `App.on_shutdown` method for registering a callback to be called when the app is shutting down. (#907)
+
+* You can now pass options to `ui.input_selectize` see the [selectize.js](https://selectize.dev/docs/API/selectize) docs for available options. (#914, #158)
+
+* `ui.input_selectize` gains the `remove_button` argument which allows you to control the visibility of the remove button.
+
+### Bug fixes
+
+* CLI command `shiny create`... (#965)
+  * has added a `-d`/`--dir` flag for saving to a specific output directory
+  * will raise an error if if will overwrite existing files
+  * prompt users to install `requirements.txt`
+
+* Fixed `js-react` template build error. (#965)
+
+* Fixed #1007: Plot interaction with plotnine provided incorrect values. (#999)
+
+### Developer features
+
+* Output renderers should now be created with the `shiny.render.renderer.Renderer` class. This class should contain either a `.transform(self, value)` method (common) or a `.render(self)` (rare). These two methods should return something can be converted to JSON. In addition, `.default_ui(self, id)` should be implemented by returning `htmltools.Tag`-like content for use within Shiny Express. To make your own output renderer, please inherit from the `Renderer[IT]` class where `IT` is the type (excluding `None`) required to be returned from the App author. (#964)
+  * Legacy renderers that will be removed in the near future:
+    * `shiny.render.RenderFunction`
+    * `shiny.render.RenderFunctionAsync`
+    * `shiny.render.transformer.OutputRenderer`
+    * `shiny.render.transformer.OutputRendererSync`
+    * `shiny.render.transformer.OutputRendererAsync`
+
+### Other changes
+
+* Pinned Starlette to version <0.35.0; versions 0.35.0 and 0.35.1 caused problems when deploying on Posit Connect. (#1009
+)
+
+
+## [0.6.1.1] - 2023-12-22
+
+### Bug fixes
+
+* Fixed #935: `shiny create` required the `requests` package, but it was not listed as a dependency. It now uses `urllib` instead, which is part of the Python standard library. (#940)
+
+
+## [0.6.1] - 2023-12-18
+
+### New features
+
+* `shiny create` now allows you to select from a list of template apps.
+
+* `shiny create` provides templates which help you build your own custom JavaScript components.
+
+* Closed #814: The functions `reactive.Calc` and `reactive.Effect` have been changed to have lowercase names: `reactive.calc`, and `reactive.effect`. The old capitalized names are now aliases to the new lowercase names, so existing code will continue to work. Similarly, the class `reactive.Value` has a new alias, `reactive.value`, but in this case, since the original was a class, it keeps the original capitalized name as the primary name. The examples have not been changed yet, but will be changed in a future release. (#822)
+
+* Added `ui.layout_columns()` for creating responsive column-forward layouts based on Bootstrap's 12-column CSS Grid. (#856)
+
+* Added support for Shiny Express apps, which has a simpler, easier-to-use API than the existing API (Shiny Core). Please note that this API is still experimental and may change. (#767)
+
+### Bug fixes
+
+* Fix support for `shiny.ui.accordion(multiple=)` (#799).
+
+### Other changes
+
+* Closed #492: `shiny.ui.nav()` is now deprecated in favor of the more aptly named `shiny.ui.nav_panel()` (#876).
+
+* Update penguins example to credit Allison Horst and drop usage of `shiny.experimental` (#798).
+
+* `as_fillable_container()` and `as_fill_item()` no longer mutate the `Tag` object that was passed in. Instead, it returns a new `Tag` object. Also closed #856: these functions now put the `html-fill-container` and `html-fill-item` CSS classes last, instead of first. (#862)
+
+* `App()` now accepts a server function with a single `input` parameter, or a server function with parameters `input`, `output` and `session`. Server functions with two or more than three parameters now raise an exception. (#920)
+
+
+## [0.6.0] - 2023-10-30
+
+### Breaking Changes
+
+* `shiny.run` only allows positional arguments for `app`, `host`, and `port`, all other arguments must be specified with keywords.
+
+### New features
+
+* `shiny run` now takes `reload-includes` and `reload-excludes` to allow you to define which files trigger a reload (#780).
+
+* `shiny.run` now passes keyword arguments to `uvicorn.run` (#780).
+
+* The `@output` decorator is no longer required for rendering functions; `@render.xxx` decorators now register themselves automatically. You can still use `@output` explicitly if you need to set specific output options (#747, #790).
+
+* Added support for integration with Quarto (#746).
+
+* Added `shiny.render.renderer_components` decorator to help create new output renderers (#621).
+
+* Added `shiny.experimental.ui.popover()`, `update_popover()`, and `toggle_popover()` for easy creation (and server-side updating) of [Bootstrap popovers](https://getbootstrap.com/docs/5.3/components/popovers/). Popovers are similar to tooltips, but are more persistent, and should primarily be used with button-like UI elements (e.g. `input_action_button()` or icons) (#680).
+
+* Added CSS classes to UI input methods (#680) .
+
+* `Session` objects can now accept an asynchronous (or synchronous) function for `.on_flush(fn=)`, `.on_flushed(fn=)`, and `.on_ended(fn=)` (#686).
+
+* `App()` now allows `static_assets` to represent multiple paths. To do this, pass in a dictionary instead of a string (#763).
+
+* The `showcase_layout` argument of `value_box()` now accepts one of three character values: `"left center"`, `"top right"`, `"bottom"`. (#772)
+
+* `value_box()` now supports many new themes and styles, or fully customizable themes using the new `value_box_theme()` function. To reflect the new capabilities, we've replaced `theme_color` with a new `theme` argument. The previous argument will continue work as expected, but with a deprecation warning. (#772)
+
+  In addition to the Bootstrap theme names (`primary` ,`secondary`, etc.), you can now use the main Boostrap colors (`purple`, `blue`, `red`, etc.). You can also choose to apply the color to the background or foreground by prepending a `bg-` or `text-` prefix to the theme or color name. Finally, we've also added new gradient themes allowing you to pair any two color names as `bg-gradient-{from}-{to}` (e.g., `bg-gradient-purple-blue`).
+
+  These named color themes aren't limited to value boxes: because they're powered by small utility classes, you can use them anywhere within your bslib-powered UI.
+
+* Added `shiny.ui.showcase_bottom()`, a new `shiny.ui.value_box()` layout that places the showcase below the value box `title` and `value`, perfect for a full-bleed plot. (#772)
+
+### Bug fixes
+
+* `shiny run` now respects the user provided `reload-dir` argument (#765).
+
+* Fixed #646: Wrap bare value box value in `<p />` tags. (#668)
+
+* Fixed #676: The `render.data_frame` selection feature was underdocumented and buggy (sometimes returning `None` as a row identifier if the pandas data frame's index had gaps in it). With this release, the selection is consistently a tuple of the 0-based row numbers of the selected rows--or `None` if no rows are selected. (#677)
+
+* Added tests to verify that ui input methods, ui labels, ui update (value) methods, and ui output methods work within modules (#696).
+
+* Adjusted the `@render.plot` input type to be `object` to allow for any object (if any) to be returned (#712).
+
+* In `layout_column_wrap()`, when `width` is a CSS unit -- e.g. `width = "400px"` or `width = "25%"` -- and `fixed_width = FALSE`, `layout_column_wrap()` will ensure that the columns are at least `width` wide, unless the parent container is narrower than `width`. (#772)
+
+### Other changes
+
+* `input_action_button()` now defaults to having whitespace around it. (#758)
+
+* `layout_sidebar()` now uses an `<aside>` element for the sidebar's container and a `<header>` element for the sidebar title. The classes of each element remain the same, but the semantic meaning of the elements is now better reflected in the HTML markup.  (#772)
+
+* `layout_sidebar()` no longer gives the sidebar main content area the `role="main"` attribute. (#772)
+
+* Improved the style and appearance of the button to enter full screen in `card()`s and `value_box()`es to better adapt to Bootstrap's dark mode. (#772)
+
+### API changes
+
+* Added `shiny.ui.navset_underline()` and `shiny.ui.navset_card_underline()` whose navigation container is similar to `shiny.ui.navset_tab()` and `shiny.ui.navset_card_tab()` respectively, but its active/focused navigation links are styled with an underline. (#772)
+
+* `shiny.ui.layout_column_wrap(width, *args)` was rearranged to `shiny.ui.layout_column_wrap(*args, width)`. Now, `width` will default to `200px` is no value is provided. (#772)
+
+* `shiny.ui.showcase_left_center()` and `shiny.ui.showcase_top_right()` no longer take two values for the `width` argument. Instead, they now take a single value (e.g., `width = "30%"`) representing the width of the showcase are in the value box. Furthermore, they've both gained `width_full_screen` arguments that determine the width of the showcase area when the value box is expanded to fill the screen. (#772)
+
+* `shiny.ui.panel_main()` and `shiny.ui.panel_sidebar()` are deprecated in favor of new API for `shiny.ui.layout_sidebar()`. Please use `shiny.ui.sidebar()` to construct a `sidebar=` and supply it to `shiny.ui.layout_sidebar(sidebar, *args, **kwargs)`. (#788)
+
+* `shiny.experimental.ui.toggle_sidebar()` has been renamed to `shiny.ui.update_sidebar()`. It's `open` value now only supports `bool` values. (#788)
+
+#### API relocations
+
+* `shiny.ui`'s `navset_pill_card()` and `navset_tab_card()` have been renamed to `navset_card_pill()` and `navset_card_tab()` respectively (#492).
+
+The following methods have been moved from `shiny.experimental.ui` and integrated into `shiny.ui` (final locations under `shiny.ui` are displayed) (#680):
+
+* Sidebar - Sidebar layout or manipulation
+  * `sidebar()`, `page_sidebar()`, `update_sidebar()`, `layout_sidebar()`, `Sidebar`
+
+* Filling layout - Allow UI components to expand into the parent container and/or allow its content to expand
+  * `page_fillable()`, `fill.as_fillable_container()`, `fill.as_fill_item()`, `fill.remove_all_fill()`
+  * `output_plot(fill=)`, `output_image(fill=)`, `output_ui(fill=, fillable=)`
+
+* CSS units - CSS units and padding
+  * `css.as_css_unit()`, `css.as_css_padding()`, `css.CssUnit`
+
+* Tooltip - Hover-based context UI element
+  * `tooltip()`, `update_tooltip()`
+
+* Popover - Click-based context UI element
+  * `popover()`, `update_popover()`
+
+* Accordion - Vertically collapsible UI element
+  * `accordion()`, `accordion_panel()`, `insert_accordion_panel()`, `remove_accordion_panel()`, `update_accordion()`, `update_accordion_panel()`, `Accordion`, `AccordionPanel`
+
+* Card - A general purpose container for grouping related UI elements together
+  * `card()`, `card_header()`, `card_footer()`, `CardItem`
+
+* Valuebox - Opinionated container for displaying a value and title
+  * `valuebox()`
+  * `showcase_left_center()`
+  * `showcase_top_right()`
+
+* Navs - Navigation within a page
+  * `navset_bar()`, `navset_tab_card()`, `navset_pill_card()`
+  * `page_navbar(sidebar=, fillable=, fillable_mobile=, gap=, padding=)`, `navset_card_tab(sidebar=)`, `navset_card_pill(sidebar=)`, `navset_bar(sidebar=, fillable=, gap=, padding=)`
+
+* Layout - Layout of UI elements
+  * `layout_column_wrap()`
+
+* Inputs - UI elements for user input
+  * `input_text_area(autoresize=)`
+
+If a ported method is called from `shiny.experimental.ui`, a deprecation warning will be displayed.
+
+Methods still under consideration in `shiny.experimental.ui`:
+
+* `card(wrapper=)`: A function (which returns a UI element) to call on unnamed arguments in `card(*args)` which are not already `shiny.ui.CardItem` objects.
+
+* `card_body()`: A container for grouping related UI elements together
+
+* `card_image()`: A general container for an image within a `shiny.ui.card`.
+
+* `card_title()`: A general container for the "title" of a `shiny.ui.card`.
+
+#### API removals
+
+* `shiny.experimental.ui.FillingLayout` has been removed. (#481)
+
+* `shiny.experimental.ui.toggle_switch()` has been made defunct. Please remove it from your code and use `shiny.ui.update_switch()` instead. (#772)
+
+* `shiny.experimental.ui.as_width_unit()` has been made defunct. Please remove it from your code. (#772)
+
+* `shiny.experimental.ui`' `as_fill_carrier()`, `is_fill_carrier()`, `is_fillable_container()`, and `is_fill_item()` have been made defunct. Remove them from your code. (#680, #788)
+
+* Support for `min_height=`, `max_height=`, and `gap=` in `shiny.experimental.ui.as_fillable_container()` and `as_fill_item()` has been removed. (#481)
+
+* `shiny.experimental.ui.TagCallable` has been made defunct. Please use its type is equivalent to `htmltools.TagFunction`. (#680)
+
+
+## [0.5.1] - 2023-08-08
+
+### Bug fixes
+
+* Fixed #666: Added missing sidebar stylesheet dependency. (#667)
+
+
+## [0.5.0] - 2023-08-01
+
+### New features
+
+* The new fast-scrolling data table/grid feature (`ui.output_data_frame`/`render.data_frame`) now has a filtering feature. To enable, pass the argument `filters=True` to the `render.DataTable` or `render.DataGrid` constructors. (#592)
+
+* `shiny run` now takes a `--reload-dir <DIR>` argument that indicates a directory `--reload` should (recursively) monitor for changes, in addition to the app's parent directory. Can be used more than once. (#353)
+
+* The default theme has been updated to use Bootstrap 5 with custom Shiny style enhancements. (#624)
+
+* Added experimental UI `tooltip()`, `update_tooltip()`, and `toggle_tooltip()` for easy creation (and server-side updating) of [Bootstrap tooltips](https://getbootstrap.com/docs/5.2/components/tooltips/) (a way to display additional information when focusing (or hovering over) a UI element). (#629)
+
+
+### Bug fixes
+
+* Using `update_slider` to update a slider's value to a `datetime` object or other non-numeric value would result in an error. (#649)
+
+### Other changes
+
+* Documentation updates. (#591)
+
+* Removed Python 3.7 support. (#590)
+
+
+## [0.4.0] - 2023-06-26
+
+### New features
+
+* Added new fast-scrolling data table and data grid outputs. (#538)
+
+* Added `include_js()` and `include_css()`, for easily including JS and CSS files in an application. (#127)
+
+* Added sidebar, card, value box, and accordion methods into `shiny.experimental.ui`. (#481)
+
+* Added `fill` and `fillable` methods into `shiny.experimental.ui`. If `fill` is `True`, then the UI component is allowed to expand into the parent container. If `fillable` is `True`, then the UI component will allow its content to expand. Both `fill` on the child component and `fillable` on the parent component must be `True` for the child component to expand. (#481)
+
+* Added sidebar methods into `shiny.experimental.ui`. `shiny.experimental.ui.layout_sidebar()` does not require `ui.panel_main()` and `ui.panel_sidebar()`. These two methods have been deprecated. `x.ui.page_navbar()`, `x.ui.navset_bar()`, `x.navset_tab_card()`, and `x.navset.pill_card()` added `sidebar=` support. (#481)
+
+* feat(sidebar): `ui.layout_sidebar()` internally uses `x.ui.layout_sidebar()`, enabling filling layout features. (#568)
+
+
+### Bug fixes
+
+* Fixed #496: Previously, when `shiny run --reload` was used, the app would only reload when a .py file changed. Now it will reload when .py, .css, .js, and .html files change. (#505)
+
+* Closed #535: Added a meta viewport tag, so that page layout will adapt to mobile device screens. (#540)
+
+## [0.3.3] - 2023-04-26
+
+### New features
+
+* Added `shiny.experimental` as a place to put experimental features. When using Shiny's experimental features, we recommend importing them by calling `import shiny.experimental as x`, so that all local function calls must start with `x` (e.g. `x.ui.card()`) to signify the method may be changed/removed without warning or future support. (#462)
+
+* Added `penguins` example. (#462)
+
+* The bootstrap HTMLDependency is now created using the dev version of `{bslib}` to get the latest features. (#462)
+
+* Added `shiny.experimental.ui.input_text_area()`, which supports auto-resizing height to fit the content when `autoresize=True`. (#463)
+
+### Other changes
+
+* `shiny.reactive.lock` is now exported. (#458)
+
+## [0.3.2] - 2023-04-19
+
+### Bug fixes
+
+* Fixed #456: plot interaction with datetimes raised errors on 32-bit platforms. (#457)
+
+### Other changes
+
+* When pyright creates type stubs for shiny, it now will include types imported in `_typing_extensions.py`.
+
+
+## [0.3.1] - 2023-04-18
+
+### Bug fixes
+
+* Fixed #443: Errors in streaming downloads previously resulted in a partially downloaded file; now Shiny responds with a `Transfer-Encoding: chunked` header, which allows the browser to detect the error and abort the download. (#447)
+
+### Other changes
+
+* `page_navbar` now accepts shinyswatch themes. (#455)
+
+
+## [0.3.0] - 2023-04-03
+
+### New features
+
+* Added support for URL based HTMLDependencies. `{htmltools}` (v0.1.5.9001) added support for URL based HTMLDependencies in rstudio/py-htmltools#53.  (#437)
+
+
+## [0.2.10] - 2023-03-11
+
+### New features
+
+* Added support for interacting with plots made with matplotlib, seaborn, and plotnine. (#392)
+
+* The `req()` function now returns its first argument (assuming none of its arguments are falsey). This lets you perform validation on expressions as you assign, return, or pass them, without needing to introduce a separate statement just to call `req()`.
+
+* Added `Input.__contains__` method, so that (for example) one could write an expression like `if "x" in inputs`. (#402)
+
+### Bug fixes
+
+* The `width` parameters for `input_select` and `input_slider` now work properly. (Thanks, @bartverweire!) (#386)
+
+* When `input_select` or `input_selectize` were not given an explicit `select` argument, they always chose the first item, which is correct when `multiple=False`, but not when `multiple=True`. Now when `multiple=True`, the first item is no longer automatically selected. (#396)
+
+### Other changes
+
+* Switched to new types from htmltools 0.1.5. (#416)
+
+
+## [0.2.9] - 2022-11-03
+
+### Bug fixes
+
+* Closed #240, #330: Fixed live examples with additional files. (#340)
+
+* Fixed `shiny run` handling on Windows of absolute paths with drive letter, as in `shiny run c:/myapp/app.py`. (#370)
+
+
+## [0.2.8] - 2022-10-20
+
+### Bug fixes
+
+* `panel_conditional` now works correctly inside of Shiny modules. (Thanks, @gcaligari!) (#336)
+
+* Fix compatibility with Uvicorn 0.19.0 (#357)
+
+
+## [0.2.7] - 2022-09-27
+
+### New features
+
+* `shiny run` now takes a `--launch-browser` argument that causes the default web browser to be launched after the app is successfully loaded. Also, the `--port` argument now interprets a value of `0` as "listen on a random port". (#329)
+
+### Other changes
+
+* Updated API document generation with updated paths to work with new version of Shinylive. (#331)
+
+
+## [0.2.6] - 2022-09-02
+
+### New features
+
+* Closed [#312](https://github.com/posit-dev/py-shiny/issues/312): Matplotlib plots in a `@render.plot` can now use the global figure, instead of returning a `figure` object. ([#314](https://github.com/posit-dev/py-shiny/pull/314))
+
+* Disabled `shiny static` command, in favor of `shinylive export` from the shinylive package. ([#326](https://github.com/posit-dev/py-shiny/pull/326))
+
+
+## [0.2.5] - 2022-08-12
+
+### New features
+
+* Closed [#269](https://github.com/posit-dev/py-shiny/issues/269): The UI for a `shiny.App` object can now be provided as a function. ([#299](https://github.com/posit-dev/py-shiny/pull/299))
+
+* When a Shinylive deployment is made with `shiny static`, it the deployment code is now delegated to Shinylive. ([#310](https://github.com/posit-dev/py-shiny/pull/310))
+
+### Bug fixes
+
+* Fixed [#279](https://github.com/posit-dev/py-shiny/issues/279): When a Shiny application is mounted to a Starlette route, reactivity did not work. ([#294](https://github.com/posit-dev/py-shiny/pull/294))
+
+* Fixed [#290](https://github.com/posit-dev/py-shiny/issues/290): `@render.plot` now works as intended inside `@module.server`. ([#292](https://github.com/posit-dev/py-shiny/pull/292))
+
+* Fixed [#289](https://github.com/posit-dev/py-shiny/issues/289): `input_selectize()` now resolves the input id before using for other id-like attributes ([#291](https://github.com/posit-dev/py-shiny/pull/291))
+
+## [0.2.4] - 2022-08-01
+
+### Bug fixes
+
+* Fixed [#287](https://github.com/posit-dev/py-shiny/issues/287): Running `shiny static` on Windows failed with `PermissionError`. ([#288](https://github.com/posit-dev/py-shiny/pull/288))
+
+## [0.2.3] - 2022-07-28
+
+### Bug fixes
+
+* Fixed [#281](https://github.com/posit-dev/py-shiny/issues/281): Directory creation for Shinylive assets could fail if the parent directory did not exist. ([#283](https://github.com/posit-dev/py-shiny/pull/283))
+
+## [0.2.2] - 2022-07-27
+
+Initial release of Shiny for Python https://shiny.posit.co/py/

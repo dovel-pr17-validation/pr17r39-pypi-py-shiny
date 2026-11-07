@@ -1,0 +1,9 @@
+include LICENSE
+
+recursive-include tests *
+
+recursive-include shiny/www *
+recursive-include shiny/templates *
+
+prune shiny/api-examples
+prune shiny/experimental/api-examples

@@ -1,0 +1,506 @@
+name: Run tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "rc-*"]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 8 * * *"
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # "3.10" must be a string; otherwise it is interpreted as 3.1.
+        python-version: ["3.14", "3.13", "3.12", "3.11", "3.10"]
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+        exclude:
+          - python-version: ${{ github.event.pull_request.draft && '3.13' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.12' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.11' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.10' }}
+          - os: ${{ github.event.pull_request.draft && 'windows-latest' }}
+          - os: ${{ github.event.pull_request.draft && 'macOS-latest' }}
+
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        id: install
+        uses: ./.github/py-shiny/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        if: steps.install.outcome == 'success' && (success() || failure())
+        run: |
+          make check-tests
+
+      - name: Type check (not Windows)
+        if: steps.install.outcome == 'success' && (success() || failure()) && matrix.os != 'windows-latest'
+        run: |
+          # Pyrefly is checked across the OS/Python matrix; Pyright still
+          # runs separately (see the `pyright` job) until shinylive's
+          # typings are validated under Pyrefly.
+          make check-types
+
+      - name: Lint code
+        if: steps.install.outcome == 'success' && (success() || failure())
+        run: |
+          make check-lint
+
+      - name: Verify code formatting
+        if: steps.install.outcome == 'success' && (success() || failure())
+        run: |
+          make check-format
+
+      - name: Verify code can run with mypy (not Windows)
+        if: steps.install.outcome == 'success' && (success() || failure()) && matrix.os != 'windows-latest'
+        run: |
+          make ci-check-mypy-can-run
+
+  pyright:
+    # `check-types` runs Pyrefly across the matrix above; keep a single
+    # Pyright run for now, until shinylive's typings are validated under
+    # Pyrefly.
+    name: "Pyright"
+    runs-on: ubuntu-latest
+    if: github.event_name != 'release'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        uses: ./.github/py-shiny/setup
+        with:
+          python-version: "3.13"
+
+      - name: Type check with Pyright
+        run: |
+          make check-pyright
+
+  oldest-deps:
+    name: "Oldest deps"
+    runs-on: ubuntu-latest
+    if: github.event_name != 'release'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install `uv`
+        # Pinned to an exact release; astral-sh/setup-uv has no floating `v10` tag
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          # setup-uv v9 flipped this default to false. We keep pruning
+          # because we store a separate cache entry per Python version, and
+          # unpruned entries risk hitting the repo cache limit and evicting
+          # each other.
+          prune-cache: true
+          cache-dependency-glob: "pyproject.toml"
+          cache-suffix: py3.10-oldest-deps
+          activate-environment: true
+          # Oldest supported Python (`requires-python` in pyproject.toml)
+          python-version: "3.10"
+
+      - name: Install oldest supported dependencies
+        run: |
+          # Resolve every direct runtime dependency (and the theme/otel
+          # extras) to its declared lower bound. `--no-emit-package shiny`
+          # keeps the released shiny wheel (pulled in transitively via
+          # shinychat) out of the constraints so it cannot conflict with the
+          # editable install below.
+          uv pip compile --resolution lowest-direct --no-emit-package shiny \
+            --extra theme --extra otel \
+            pyproject.toml -o lowest-constraints.txt
+          cat lowest-constraints.txt
+
+          # The unit tests also need the `test` extra's tooling, but some of
+          # its version floors (e.g. shinychat's) sit above the runtime pins,
+          # so extract the same package *names* without their specifiers and
+          # let the constraints file decide the versions. logfire is skipped:
+          # every logfire release compatible with the pinned
+          # opentelemetry-sdk floor predates the API its tests exercise, and
+          # those tests skip when logfire is absent.
+          uv run --no-project --with packaging --with tomli python - > test-tooling.txt <<'EOF'
+          import tomli
+          from packaging.requirements import Requirement
+
+          with open("pyproject.toml", "rb") as f:
+              project = tomli.load(f)["project"]
+
+          for dep in project["optional-dependencies"]["test"]:
+              req = Requirement(dep)
+              if req.name == "logfire":
+                  continue
+              extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+              marker = f" ; {req.marker}" if req.marker else ""
+              print(f"{req.name}{extras}{marker}")
+          EOF
+          cat test-tooling.txt
+
+          uv pip install -e ".[theme,otel]" -r test-tooling.txt \
+            --constraint lowest-constraints.txt
+
+      - name: Pip list
+        run: |
+          uv pip list
+
+      - name: Run unit tests
+        run: |
+          make check-tests
+
+  pypi:
+    name: "Deploy to PyPI"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: "Set up Python 3.10"
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          make install-deps
+          make install
+      - name: "Build Package"
+        run: |
+          make dist
+
+      # test deploy ----
+      - name: "Test Deploy to PyPI"
+        uses: pypa/gh-action-pypi-publish@release/v1
+        if: startsWith(github.event.release.name, 'TEST')
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_TEST_API_TOKEN }}
+          repository-url: https://test.pypi.org/legacy/
+
+      ## prod deploy ----
+      - name: "Deploy to PyPI"
+        uses: pypa/gh-action-pypi-publish@release/v1
+        if: startsWith(github.event.release.name, 'shiny')
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+  playwright-shiny:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    # `packages: write` lets GITHUB_TOKEN push the Playwright image to GHCR
+    # (the lazy pull-through cache in setup-playwright-remote). Job-level
+    # permissions replace the workflow-level grant, so restate `contents: read`.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        python-version: ["3.14", "3.13", "3.12", "3.11", "3.10"]
+        browser: ["chromium", "firefox", "webkit"]
+        shard: [0, 1, 2, 3]
+        exclude:
+          - python-version: ${{ github.event.pull_request.draft && '3.13' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.12' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.11' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.10' }}
+          - browser: ${{ github.event.pull_request.draft && 'firefox' }}
+          - browser: ${{ github.event.pull_request.draft && 'webkit' }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        uses: ./.github/py-shiny/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Determine browsers for testing
+        uses: ./.github/py-shiny/pytest-browsers
+        id: browsers
+        with:
+          browser: ${{ matrix.browser }}
+
+      - name: Setup remote Playwright
+        uses: ./.github/py-shiny/setup-playwright-remote
+        with:
+          browser: ${{ matrix.browser }}
+
+      - name: Run End-to-End tests
+        # Healthy shards finish in ~4 minutes; kill stragglers quickly
+        timeout-minutes: 10
+        run: |
+          make playwright-shiny SUB_FILE=". --numprocesses 3 --num-shards 4 --shard-id ${{ matrix.shard }}" ${{ steps.browsers.outputs.browsers }}
+      - name: Show Playwright server logs on failure
+        if: failure()
+        run: |
+          docker inspect --format '{{json .State}}' playwright || true
+          docker logs playwright || true
+
+  # End-to-end tests for behavior that differs on Windows. The other Playwright
+  # jobs run on Ubuntu, where these tests pass either way. For example, on
+  # Windows a websocket write made while an earlier write is still in flight goes
+  # out only when the event loop runs again (#1381).
+  playwright-windows:
+    if: github.event_name != 'release'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        uses: ./.github/py-shiny/setup
+
+      - name: Run Windows-specific End-to-End tests
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          # No `--with-deps`: on Windows it only adds the Media Foundation feature,
+          # which headless Chromium doesn't need, and that takes about 3 minutes.
+          make playwright-shiny SUB_FILE="bugs/1381-busy-indicator-progress" PLAYWRIGHT_BROWSERS=chromium PLAYWRIGHT_INSTALL_ARGS=--only-shell PYTEST_BROWSERS="--browser chromium"
+
+  playwright-examples:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    # `packages: write` lets GITHUB_TOKEN push the Playwright image to GHCR
+    # (the lazy pull-through cache in setup-playwright-remote). Job-level
+    # permissions replace the workflow-level grant, so restate `contents: read`.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        python-version: ["3.14", "3.13", "3.12", "3.11", "3.10"]
+        browser: ["chromium", "firefox", "webkit"]
+        shard: [0, 1, 2, 3]
+        exclude:
+          - python-version: ${{ github.event.pull_request.draft && '3.13' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.12' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.11' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.10' }}
+          - browser: ${{ github.event.pull_request.draft && 'firefox' }}
+          - browser: ${{ github.event.pull_request.draft && 'webkit' }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        uses: ./.github/py-shiny/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Determine browsers for testing
+        uses: ./.github/py-shiny/pytest-browsers
+        id: browsers
+        with:
+          browser: ${{ matrix.browser }}
+
+      - name: Install node.js
+        uses: actions/setup-node@v6
+        with:
+          cache: npm
+          cache-dependency-path: examples/brownian/shinymediapipe/package-lock.json
+      - name: Install node.js package
+        working-directory: examples/brownian/shinymediapipe
+        run: |
+          npm ci
+      - name: Checkout py-shiny-templates repository
+        uses: actions/checkout@v6
+        with:
+          repository: posit-dev/py-shiny-templates
+          path: py-shiny-templates
+
+      - name: Install py-shiny-templates dependencies
+        run: |
+          make ci-install-py-shiny-templates-deps
+
+      - name: Setup remote Playwright
+        uses: ./.github/py-shiny/setup-playwright-remote
+        with:
+          browser: ${{ matrix.browser }}
+
+      - name: Run example app tests
+        # Healthy shards finish in ~4 minutes; kill stragglers quickly
+        timeout-minutes: 10
+        run: |
+          make playwright-examples SUB_FILE=". --numprocesses 3 --num-shards 4 --shard-id ${{ matrix.shard }}" ${{ steps.browsers.outputs.browsers }}
+      - name: Show Playwright server logs on failure
+        if: failure()
+        run: |
+          docker inspect --format '{{json .State}}' playwright || true
+          docker logs playwright || true
+
+  playwright-ai:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    # `packages: write` lets GITHUB_TOKEN push the Playwright image to GHCR
+    # (the lazy pull-through cache in setup-playwright-remote). Job-level
+    # permissions replace the workflow-level grant, so restate `contents: read`.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        python-version: ["3.14", "3.13", "3.12", "3.11", "3.10"]
+        browser: ["chromium", "firefox", "webkit"]
+        shard: [0, 1]
+        exclude:
+          - python-version: ${{ github.event.pull_request.draft && '3.13' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.12' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.11' }}
+          - python-version: ${{ github.event.pull_request.draft && '3.10' }}
+          - browser: ${{ github.event.pull_request.draft && 'firefox' }}
+          - browser: ${{ github.event.pull_request.draft && 'webkit' }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        uses: ./.github/py-shiny/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Determine browsers for testing
+        uses: ./.github/py-shiny/pytest-browsers
+        id: browsers
+        with:
+          browser: ${{ matrix.browser }}
+
+      - name: Setup remote Playwright
+        uses: ./.github/py-shiny/setup-playwright-remote
+        with:
+          browser: ${{ matrix.browser }}
+
+      - name: Run playwright tests for AI generated apps
+        # Healthy shards finish in ~4 minutes; kill stragglers quickly
+        timeout-minutes: 10
+        run: |
+          make playwright-ai SUB_FILE=". --numprocesses 3 --num-shards 2 --shard-id ${{ matrix.shard }}" ${{ steps.browsers.outputs.browsers }}
+      - name: Show Playwright server logs on failure
+        if: failure()
+        run: |
+          docker inspect --format '{{json .State}}' playwright || true
+          docker logs playwright || true
+
+  playwright-deploys-precheck:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    # `packages: write` lets GITHUB_TOKEN push the Playwright image to GHCR
+    # (the lazy pull-through cache in setup-playwright-remote). Job-level
+    # permissions replace the workflow-level grant, so restate `contents: read`.
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        # Matches deploy server python version
+        python-version: ["3.10"]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup py-shiny
+        uses: ./.github/py-shiny/setup
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Determine browsers for testing
+        uses: ./.github/py-shiny/pytest-browsers
+        id: browsers
+        with:
+          all-browsers: ${{ ! github.event.pull_request.draft }}
+
+      - name: Setup remote Playwright
+        uses: ./.github/py-shiny/setup-playwright-remote
+
+      - name: Test that deployable example apps work
+        timeout-minutes: 5 # ~10s locally
+        env:
+          DEPLOY_APPS: "false"
+        run: |
+          make playwright-deploys
+      - name: Show Playwright server logs on failure
+        if: failure()
+        run: |
+          docker inspect --format '{{json .State}}' playwright || true
+          docker logs playwright || true
+
+  test-narwhals-integration:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'release'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # Pinned to an exact release; astral-sh/setup-uv has no floating `v10` tag
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          # setup-uv v9 flipped this default to false. We keep pruning
+          # because we store a separate cache entry per Python version, and
+          # unpruned entries risk hitting the repo cache limit and evicting
+          # each other.
+          prune-cache: true
+
+      - name: Narwhals integration setup
+        uses: ./.github/py-shiny/narwhals-setup
+        with:
+          shiny-dir: "."
+
+      - name: Narwhals integration test
+        uses: ./.github/py-shiny/narwhals-test
+        with:
+          shiny-dir: "."
+
+  # Single stable check for branch protection / auto-merge. Jobs above may be
+  # renamed or re-matrixed freely, but every PR job MUST be listed in `needs`
+  # below or its failure will not block merging.
+  pr-gate:
+    name: "PR checks"
+    # `always()` is required: without it, an upstream failure would make this
+    # job skip, and GitHub treats a skipped required check as satisfied.
+    # Skipping on draft PRs is safe for the same reason in reverse: drafts
+    # cannot be merged (or auto-merged) regardless, and skipping avoids
+    # failure emails from the reduced draft test matrix. Marking the PR
+    # ready for review re-triggers the workflow with the full matrix.
+    if: always() && github.event_name == 'pull_request' && !github.event.pull_request.draft
+    needs:
+      - check
+      - pyright
+      - oldest-deps
+      - playwright-shiny
+      - playwright-windows
+      - playwright-examples
+      - playwright-ai
+      - playwright-deploys-precheck
+      - test-narwhals-integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify that all PR jobs succeeded
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "Job results: $RESULTS"
+          if echo "$RESULTS" | grep -qE 'failure|cancelled|skipped'; then
+            exit 1
+          fi

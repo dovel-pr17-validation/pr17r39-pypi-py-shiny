@@ -1,0 +1,53 @@
+name: 'setup py-shiny'
+description: 'Action that installs python, installs py-shiny dependencies, and installs py-shiny'
+inputs:
+  python-version:
+    description: 'Python version to use'
+    required: false
+    default: "3.14"
+runs:
+  using: "composite"
+  steps:
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      # Installs the `uv` binary directly (no pip bootstrap) and caches uv's
+      # package cache between runs, keyed on pyproject.toml + python version.
+      #
+      # `activate-environment` creates and activates a venv in the workspace
+      # instead of installing into setup-python's site-packages. This matters
+      # on Windows runners: the workspace, RUNNER_TEMP (uv's cache), and the
+      # venv are all on the fast `D:` drive, so installs hardlink from the
+      # cache instead of copying files onto the slow `C:` drive where
+      # setup-python's interpreter lives.
+      - name: Install `uv`
+        # Pinned to an exact release; astral-sh/setup-uv has no floating `v10` tag
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          # setup-uv v9 flipped this default to false. We keep pruning
+          # because we store a separate cache entry per Python version, and
+          # unpruned entries risk hitting the repo cache limit and evicting
+          # each other.
+          prune-cache: true
+          cache-dependency-glob: "pyproject.toml"
+          cache-suffix: py${{ inputs.python-version }}
+          activate-environment: true
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          make ci-install-deps
+
+      - name: Install
+        shell: bash
+        run: |
+          make ci-install-wheel
+
+      - name: Pip list
+        shell: bash
+        run: |
+          uv pip list
